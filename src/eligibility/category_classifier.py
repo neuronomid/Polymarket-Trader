@@ -1,0 +1,317 @@
+"""Deterministic category classifier.
+
+Maps market tags, slugs, and metadata to allowed/excluded categories.
+Tier D: fully deterministic pattern matching. LLM escalation is flagged
+but NOT implemented here (reserved for genuinely ambiguous cases, rare).
+
+Spec: Phase 4 Step 1.
+"""
+
+from __future__ import annotations
+
+import re
+
+from core.constants import CATEGORY_QUALITY_TIERS
+from core.enums import Category, CategoryQualityTier, ExcludedCategory
+from eligibility.types import CategoryClassification
+
+# --- Category keyword mappings ---
+# These are the deterministic patterns applied to tags, slugs, titles, and
+# the raw category string from the Gamma API.
+
+_EXCLUDED_KEYWORDS: dict[str, ExcludedCategory] = {
+    # News
+    "news": ExcludedCategory.NEWS,
+    "breaking": ExcludedCategory.NEWS,
+    "headline": ExcludedCategory.NEWS,
+    "media": ExcludedCategory.NEWS,
+    # Culture
+    "culture": ExcludedCategory.CULTURE,
+    "entertainment": ExcludedCategory.CULTURE,
+    "celebrity": ExcludedCategory.CULTURE,
+    "movies": ExcludedCategory.CULTURE,
+    "tv": ExcludedCategory.CULTURE,
+    "music": ExcludedCategory.CULTURE,
+    "pop culture": ExcludedCategory.CULTURE,
+    "pop-culture": ExcludedCategory.CULTURE,
+    "social media": ExcludedCategory.CULTURE,
+    "viral": ExcludedCategory.CULTURE,
+    "influencer": ExcludedCategory.CULTURE,
+    # Crypto
+    "crypto": ExcludedCategory.CRYPTO,
+    "cryptocurrency": ExcludedCategory.CRYPTO,
+    "bitcoin": ExcludedCategory.CRYPTO,
+    "ethereum": ExcludedCategory.CRYPTO,
+    "defi": ExcludedCategory.CRYPTO,
+    "nft": ExcludedCategory.CRYPTO,
+    "token": ExcludedCategory.CRYPTO,
+    "blockchain": ExcludedCategory.CRYPTO,
+    # Weather
+    "weather": ExcludedCategory.WEATHER,
+    "temperature": ExcludedCategory.WEATHER,
+    "hurricane": ExcludedCategory.WEATHER,
+    "storm": ExcludedCategory.WEATHER,
+    "climate": ExcludedCategory.WEATHER,
+}
+
+_ALLOWED_KEYWORDS: dict[str, Category] = {
+    # Politics
+    "politics": Category.POLITICS,
+    "election": Category.POLITICS,
+    "congress": Category.POLITICS,
+    "senate": Category.POLITICS,
+    "president": Category.POLITICS,
+    "presidential": Category.POLITICS,
+    "governor": Category.POLITICS,
+    "legislation": Category.POLITICS,
+    "bill": Category.POLITICS,
+    "vote": Category.POLITICS,
+    "primary": Category.POLITICS,
+    "ballot": Category.POLITICS,
+    "impeachment": Category.POLITICS,
+    "party": Category.POLITICS,
+    "democrat": Category.POLITICS,
+    "republican": Category.POLITICS,
+    "political": Category.POLITICS,
+    # Geopolitics
+    "geopolitics": Category.GEOPOLITICS,
+    "international": Category.GEOPOLITICS,
+    "diplomacy": Category.GEOPOLITICS,
+    "treaty": Category.GEOPOLITICS,
+    "sanctions": Category.GEOPOLITICS,
+    "war": Category.GEOPOLITICS,
+    "conflict": Category.GEOPOLITICS,
+    "nato": Category.GEOPOLITICS,
+    "united nations": Category.GEOPOLITICS,
+    "foreign policy": Category.GEOPOLITICS,
+    "tariff": Category.GEOPOLITICS,
+    "trade war": Category.GEOPOLITICS,
+    # Technology
+    "technology": Category.TECHNOLOGY,
+    "tech": Category.TECHNOLOGY,
+    "ai": Category.TECHNOLOGY,
+    "artificial intelligence": Category.TECHNOLOGY,
+    "saas": Category.TECHNOLOGY,
+    "apple": Category.TECHNOLOGY,
+    "google": Category.TECHNOLOGY,
+    "microsoft": Category.TECHNOLOGY,
+    "semiconductor": Category.TECHNOLOGY,
+    "regulation tech": Category.TECHNOLOGY,
+    "antitrust": Category.TECHNOLOGY,
+    "startup": Category.TECHNOLOGY,
+    # Science & Health
+    "science": Category.SCIENCE_HEALTH,
+    "health": Category.SCIENCE_HEALTH,
+    "fda": Category.SCIENCE_HEALTH,
+    "drug": Category.SCIENCE_HEALTH,
+    "pharmaceutical": Category.SCIENCE_HEALTH,
+    "clinical trial": Category.SCIENCE_HEALTH,
+    "vaccine": Category.SCIENCE_HEALTH,
+    "pandemic": Category.SCIENCE_HEALTH,
+    "medical": Category.SCIENCE_HEALTH,
+    "research": Category.SCIENCE_HEALTH,
+    "nasa": Category.SCIENCE_HEALTH,
+    "space": Category.SCIENCE_HEALTH,
+    # Macro / Policy
+    "macro": Category.MACRO_POLICY,
+    "federal reserve": Category.MACRO_POLICY,
+    "fed": Category.MACRO_POLICY,
+    "interest rate": Category.MACRO_POLICY,
+    "inflation": Category.MACRO_POLICY,
+    "gdp": Category.MACRO_POLICY,
+    "unemployment": Category.MACRO_POLICY,
+    "fiscal": Category.MACRO_POLICY,
+    "monetary": Category.MACRO_POLICY,
+    "central bank": Category.MACRO_POLICY,
+    "economic": Category.MACRO_POLICY,
+    "economy": Category.MACRO_POLICY,
+    "cpi": Category.MACRO_POLICY,
+    # Sports
+    "sports": Category.SPORTS,
+    "nba": Category.SPORTS,
+    "nfl": Category.SPORTS,
+    "mlb": Category.SPORTS,
+    "nhl": Category.SPORTS,
+    "soccer": Category.SPORTS,
+    "football": Category.SPORTS,
+    "basketball": Category.SPORTS,
+    "baseball": Category.SPORTS,
+    "tennis": Category.SPORTS,
+    "ufc": Category.SPORTS,
+    "mma": Category.SPORTS,
+    "boxing": Category.SPORTS,
+    "cricket": Category.SPORTS,
+    "formula 1": Category.SPORTS,
+    "f1": Category.SPORTS,
+    "premier league": Category.SPORTS,
+    "champions league": Category.SPORTS,
+    "world cup": Category.SPORTS,
+    "super bowl": Category.SPORTS,
+    "stanley cup": Category.SPORTS,
+    "world series": Category.SPORTS,
+    "olympics": Category.SPORTS,
+}
+
+# Maps Gamma API category strings to our internal categories
+_API_CATEGORY_MAP: dict[str, Category] = {
+    "politics": Category.POLITICS,
+    "us-politics": Category.POLITICS,
+    "world-politics": Category.GEOPOLITICS,
+    "geopolitics": Category.GEOPOLITICS,
+    "technology": Category.TECHNOLOGY,
+    "science": Category.SCIENCE_HEALTH,
+    "health": Category.SCIENCE_HEALTH,
+    "science-health": Category.SCIENCE_HEALTH,
+    "economics": Category.MACRO_POLICY,
+    "macro": Category.MACRO_POLICY,
+    "sports": Category.SPORTS,
+}
+
+_API_EXCLUDED_MAP: dict[str, ExcludedCategory] = {
+    "news": ExcludedCategory.NEWS,
+    "culture": ExcludedCategory.CULTURE,
+    "entertainment": ExcludedCategory.CULTURE,
+    "pop-culture": ExcludedCategory.CULTURE,
+    "crypto": ExcludedCategory.CRYPTO,
+    "cryptocurrency": ExcludedCategory.CRYPTO,
+    "weather": ExcludedCategory.WEATHER,
+}
+
+
+def classify_category(
+    *,
+    raw_category: str | None = None,
+    tags: list[str] | None = None,
+    slug: str | None = None,
+    title: str = "",
+) -> CategoryClassification:
+    """Classify a market into an allowed or excluded category.
+
+    Priority order:
+    1. Raw API category string (direct map)
+    2. Tag-based matching
+    3. Slug-based matching
+    4. Title keyword matching
+    5. Unknown (flagged for potential LLM escalation)
+
+    Returns:
+        CategoryClassification with the determined category, exclusion status,
+        and quality tier.
+    """
+
+    # --- Step 1: Try raw API category ---
+    if raw_category:
+        norm_cat = raw_category.strip().lower().replace(" ", "-")
+
+        # Check excluded first
+        if norm_cat in _API_EXCLUDED_MAP:
+            excluded = _API_EXCLUDED_MAP[norm_cat]
+            return CategoryClassification(
+                category=None,
+                is_excluded=True,
+                quality_tier="excluded",
+                confidence=1.0,
+                classification_method="api_category_excluded",
+                raw_category=raw_category,
+            )
+
+        # Check allowed
+        if norm_cat in _API_CATEGORY_MAP:
+            cat = _API_CATEGORY_MAP[norm_cat]
+            tier = CATEGORY_QUALITY_TIERS.get(cat.value, "standard")
+            return CategoryClassification(
+                category=cat.value,
+                is_excluded=False,
+                quality_tier=tier,
+                confidence=1.0,
+                classification_method="api_category",
+                raw_category=raw_category,
+            )
+
+    # --- Step 2: Tag-based matching ---
+    tags = tags or []
+    for tag in tags:
+        norm_tag = tag.strip().lower()
+        # Check excluded
+        for keyword, excluded in _EXCLUDED_KEYWORDS.items():
+            if keyword in norm_tag:
+                return CategoryClassification(
+                    category=None,
+                    is_excluded=True,
+                    quality_tier="excluded",
+                    confidence=0.9,
+                    classification_method="tag_match",
+                    raw_category=raw_category,
+                )
+        # Check allowed
+        for keyword, cat in _ALLOWED_KEYWORDS.items():
+            if keyword in norm_tag:
+                tier = CATEGORY_QUALITY_TIERS.get(cat.value, "standard")
+                return CategoryClassification(
+                    category=cat.value,
+                    is_excluded=False,
+                    quality_tier=tier,
+                    confidence=0.9,
+                    classification_method="tag_match",
+                    raw_category=raw_category,
+                )
+
+    # --- Step 3: Slug-based matching ---
+    if slug:
+        norm_slug = slug.strip().lower()
+        for keyword, excluded in _EXCLUDED_KEYWORDS.items():
+            if keyword in norm_slug:
+                return CategoryClassification(
+                    category=None,
+                    is_excluded=True,
+                    quality_tier="excluded",
+                    confidence=0.85,
+                    classification_method="slug_match",
+                    raw_category=raw_category,
+                )
+        for keyword, cat in _ALLOWED_KEYWORDS.items():
+            if keyword in norm_slug:
+                tier = CATEGORY_QUALITY_TIERS.get(cat.value, "standard")
+                return CategoryClassification(
+                    category=cat.value,
+                    is_excluded=False,
+                    quality_tier=tier,
+                    confidence=0.85,
+                    classification_method="slug_match",
+                    raw_category=raw_category,
+                )
+
+    # --- Step 4: Title keyword matching ---
+    if title:
+        norm_title = title.strip().lower()
+        for keyword, excluded in _EXCLUDED_KEYWORDS.items():
+            if keyword in norm_title:
+                return CategoryClassification(
+                    category=None,
+                    is_excluded=True,
+                    quality_tier="excluded",
+                    confidence=0.75,
+                    classification_method="title_match",
+                    raw_category=raw_category,
+                )
+        for keyword, cat in _ALLOWED_KEYWORDS.items():
+            if keyword in norm_title:
+                tier = CATEGORY_QUALITY_TIERS.get(cat.value, "standard")
+                return CategoryClassification(
+                    category=cat.value,
+                    is_excluded=False,
+                    quality_tier=tier,
+                    confidence=0.75,
+                    classification_method="title_match",
+                    raw_category=raw_category,
+                )
+
+    # --- Step 5: Unknown category ---
+    return CategoryClassification(
+        category=None,
+        is_excluded=False,
+        quality_tier="unknown",
+        confidence=0.0,
+        classification_method="unclassified",
+        raw_category=raw_category,
+    )
