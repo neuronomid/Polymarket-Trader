@@ -84,6 +84,7 @@ class BaseAgent:
         self._log = structlog.get_logger(
             component=f"agent.{self.role_name or 'unknown'}"
         )
+        self._active_result: AgentResult | None = None
 
     @property
     def tier(self) -> ModelTier:
@@ -132,7 +133,11 @@ class BaseAgent:
                 agent_input.operator_mode = regime.operator_mode
 
             # Execute the agent's domain logic
-            output = await self._execute(agent_input, regime)
+            self._active_result = result
+            try:
+                output = await self._execute(agent_input, regime)
+            finally:
+                self._active_result = None
 
             result.result = output if isinstance(output, dict) else {"output": output}
             result.success = True
@@ -241,8 +246,14 @@ class BaseAgent:
         )
 
         # Track the call
-        if result is not None:
-            result.add_call_record(call_record)
+        target_result = result or self._active_result
+        if target_result is not None:
+            target_result.add_call_record(call_record)
+            if (
+                self._active_result is not None
+                and self._active_result is not target_result
+            ):
+                self._active_result.add_call_record(call_record)
 
         return response
 

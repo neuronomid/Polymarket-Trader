@@ -155,6 +155,17 @@ class TriggerScanner:
         """Get a copy of the current watch list."""
         return list(self._watch_list.values())
 
+    def get_watch_entry(self, token_id: str) -> MarketWatchEntry | None:
+        """Fetch a single watch entry by token ID."""
+        return self._watch_list.get(token_id)
+
+    def get_watch_entry_by_market(self, market_id: str) -> MarketWatchEntry | None:
+        """Fetch the first watch entry matching a market ID."""
+        for entry in self._watch_list.values():
+            if entry.market_id == market_id:
+                return entry
+        return None
+
     # --- Callback ---
 
     def set_trigger_callback(self, callback: callable) -> None:

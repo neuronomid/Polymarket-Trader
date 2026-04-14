@@ -244,6 +244,7 @@ class ResearchPackResult(BaseModel):
     # Cost tracking
     total_research_cost_usd: float = 0.0
     agents_invoked: list[str] = Field(default_factory=list)
+    per_agent_costs: dict[str, float] = Field(default_factory=dict)
 
 
 # --- Candidate Context ---
@@ -461,6 +462,7 @@ class InvestigationResult(BaseModel):
     # Cost tracking
     estimated_cost_usd: float = 0.0
     actual_cost_usd: float = 0.0
+    agent_costs: dict[str, float] = Field(default_factory=dict)
 
     # Metadata
     candidates_evaluated: int = 0

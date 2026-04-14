@@ -232,6 +232,10 @@ class MarketDataService:
         """Return cache health statistics."""
         return await self._cache.stats()
 
+    def get_cache_stats_snapshot(self) -> CacheStats:
+        """Return an immediate cache snapshot for synchronous dashboard sync."""
+        return self._cache.snapshot_stats()
+
     async def run_eviction(self) -> int:
         """Evict expired cache entries. Call periodically."""
         evicted = await self._cache.evict_expired()

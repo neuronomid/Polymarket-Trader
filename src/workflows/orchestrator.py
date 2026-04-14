@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
+from sqlalchemy import func, select
 
 from agents.providers import ProviderRouter
 from agents.regime import RegimeAdapter
@@ -41,16 +42,22 @@ from calibration.store import CalibrationStore
 from config.settings import AppConfig
 from core.enums import (
     CalibrationRegime,
+    CategoryQualityTier,
+    CostClass,
     EligibilityOutcome,
+    ModelTier,
     NotificationSeverity,
     NotificationType,
     OperatorMode,
     TriggerLevel,
 )
 from cost.governor import CostGovernor
+from cost.types import CostRecordInput
 from data.database import close_db, get_session_factory, init_db
 from eligibility.engine import EligibilityEngine
 from eligibility.types import MarketEligibilityInput
+from execution.engine import ExecutionEngine
+from execution.types import EntryMode, ExecutionOutcome, ExecutionRequest
 from investigation.orchestrator import InvestigationOrchestrator
 from investigation.types import (
     CandidateContext,
@@ -103,6 +110,8 @@ class WorkflowOrchestrator:
         # Used so that mode changes made via the dashboard are respected by the pipeline
         # without requiring a restart.
         self._dashboard_state: dict[str, Any] | None = None
+        self._session_factory: Any | None = None
+        self._market_catalog: dict[str, Any] = {}
 
         # --- Subsystems (initialized in initialize()) ---
         # Core infrastructure
@@ -122,6 +131,7 @@ class WorkflowOrchestrator:
         self._investigator: InvestigationOrchestrator | None = None
         self._resolution_parser: ResolutionParser | None = None
         self._tradeability: TradeabilitySynthesizer | None = None
+        self._execution_engine = ExecutionEngine(config.risk)
 
         # Position management
         # (PositionReviewManager wired separately when positions exist)
@@ -162,6 +172,9 @@ class WorkflowOrchestrator:
         # Pipeline lock for sequential processing
         self._pipeline_lock = asyncio.Lock()
 
+        # Investigation cooldown: market_id → (rejected_at, price_at_rejection)
+        self._investigation_cooldown: dict[str, tuple[datetime, float]] = {}
+
     # ================================================================
     # Lifecycle
     # ================================================================
@@ -189,6 +202,7 @@ class WorkflowOrchestrator:
             _log.error("database_init_failed", url_type="sqlite" if "sqlite" in db_url else "postgres", error=str(exc))
             raise
         session_factory = get_session_factory()
+        self._session_factory = session_factory
         _log.info("database_initialized")
         self._log_activity("system", "Database", "Database initialized", severity="success")
 
@@ -321,7 +335,7 @@ class WorkflowOrchestrator:
 
         self._log_activity(
             "system", "Orchestrator",
-            f"System initialized in {self._config.operator_mode} mode with ${getattr(self._config, 'paper_balance_usd', 500.0):.2f}",
+            f"System initialized in {self._current_mode().value} mode with ${getattr(self._config, 'paper_balance_usd', 500.0):.2f}",
             severity="success",
         )
         _log.info("orchestrator_initialized", subsystems=12)
@@ -337,7 +351,7 @@ class WorkflowOrchestrator:
 
         # Reset daily governors
         self._cost_governor.reset_day()
-        self._risk_governor.reset_day(start_of_day_equity=self._portfolio.account_balance_usd)
+        self._risk_governor.reset_day(start_of_day_equity=self._portfolio.current_equity_usd)
 
         # Start notification service
         self._notification_service.start()
@@ -362,12 +376,12 @@ class WorkflowOrchestrator:
         # Emit startup notification
         await self._emit_system_health_event(
             "system_started",
-            f"Polymarket Trader started in {self._config.operator_mode} mode",
+            f"Polymarket Trader started in {self._current_mode().value} mode",
         )
 
         self._log_activity(
             "system", "Orchestrator",
-            f"System LIVE in {self._config.operator_mode.upper()} mode",
+            f"System LIVE in {self._current_mode().value.upper()} mode",
             detail=f"{self._scheduler.task_count} scheduled tasks registered",
             severity="success",
         )
@@ -423,6 +437,8 @@ class WorkflowOrchestrator:
         Routes actionable triggers through the full pipeline:
         eligibility → investigation → tradeability → risk/cost → execution.
         """
+        await self._refresh_runtime_portfolio_state()
+
         self._state.total_scans += 1
         self._state.total_triggers += len(batch.triggers)
 
@@ -436,6 +452,7 @@ class WorkflowOrchestrator:
         try:
             from dashboard_api.app import _add_trigger_event
             for t in batch.triggers:
+                watch_entry = self._get_watch_entry(token_id=t.token_id, market_id=t.market_id)
                 _add_trigger_event(
                     trigger_class=t.trigger_class.value if hasattr(t.trigger_class, "value") else str(t.trigger_class),
                     trigger_level=t.trigger_level.value if hasattr(t.trigger_level, "value") else str(t.trigger_level),
@@ -444,9 +461,12 @@ class WorkflowOrchestrator:
                     price=t.price,
                     spread=t.spread,
                     data_source=getattr(t, "data_source", "live"),
+                    market_title=watch_entry.title if watch_entry else None,
                 )
         except Exception:
             pass
+
+        await self._persist_trigger_events(batch.triggers)
 
         actionable = batch.actionable_triggers
         if not actionable:
@@ -516,19 +536,9 @@ class WorkflowOrchestrator:
         # Build candidate contexts from triggers
         candidates: list[CandidateContext] = []
         for trigger in triggers:
-            candidate = CandidateContext(
-                market_id=trigger.market_id or trigger.token_id,
-                token_id=trigger.token_id,
-                title=trigger.reason or "",
-                category=getattr(trigger, "category", "unknown"),
-                trigger_class=trigger.trigger_class,
-                trigger_level=trigger.trigger_level,
-                price=trigger.price or 0.5,
-                mid_price=trigger.price or 0.5,
-                spread=trigger.spread or 0.0,
-                visible_depth_usd=(trigger.depth_snapshot or {}).get("top3_usd", 0.0),
-            )
-            candidates.append(candidate)
+            candidate = await self._build_candidate_from_trigger(trigger)
+            if candidate is not None:
+                candidates.append(candidate)
 
         if not candidates:
             return
@@ -544,6 +554,14 @@ class WorkflowOrchestrator:
 
         # Record workflow start
         run_started = datetime.now(tz=UTC)
+        await self._persist_workflow_run(
+            workflow_run_id=run_id,
+            run_type="trigger_based",
+            status="running",
+            started_at=run_started,
+            market_id=candidates[0].market_id if len(candidates) == 1 else None,
+            operator_mode=self._current_mode().value,
+        )
         try:
             from dashboard_api.app import _add_workflow_run
             _add_workflow_run(
@@ -567,10 +585,32 @@ class WorkflowOrchestrator:
                 request,
                 regime=self._build_regime_context(),
             )
+            self._record_investigation_spend(run_id, result)
 
             run_cost = getattr(result, "actual_cost_usd", 0.0) or 0.0
 
             # Update workflow run as completed
+            workflow_outcome = (
+                "candidate_accepted"
+                if result.thesis_cards
+                else "no_trade"
+            )
+            outcome_reason = None
+            if result.no_trade_results:
+                outcome_reason = "; ".join(
+                    nt.reason for nt in result.no_trade_results if getattr(nt, "reason", "")
+                )[:500]
+            await self._persist_workflow_run(
+                workflow_run_id=run_id,
+                run_type="trigger_based",
+                status="completed",
+                completed_at=datetime.now(tz=UTC),
+                actual_cost_usd=run_cost,
+                outcome=workflow_outcome,
+                outcome_reason=outcome_reason,
+                market_id=candidates[0].market_id if len(candidates) == 1 else None,
+                operator_mode=self._current_mode().value,
+            )
             try:
                 from dashboard_api.app import _add_workflow_run, _record_agent_invocation
                 _add_workflow_run(
@@ -583,8 +623,9 @@ class WorkflowOrchestrator:
                     started_at=run_started,
                     completed_at=datetime.now(tz=UTC),
                 )
-                if run_cost > 0:
-                    _record_agent_invocation("investigator_orchestration", run_cost)
+                for role, cost in (getattr(result, "agent_costs", None) or {}).items():
+                    if cost > 0:
+                        _record_agent_invocation(role, cost)
             except Exception:
                 pass
 
@@ -603,6 +644,16 @@ class WorkflowOrchestrator:
                     # Emit no-trade notification
                     await self._emit_no_trade_event(nt)
 
+                # Record investigation cooldowns for all rejected candidates
+                for nt in result.no_trade_results:
+                    nt_market_id = getattr(nt, "market_id", None)
+                    if nt_market_id:
+                        candidate_price = next(
+                            (c.price for c in candidates if c.market_id == nt_market_id),
+                            None,
+                        )
+                        self._record_investigation_rejection(nt_market_id, candidate_price)
+
             # Process accepted thesis cards through remaining pipeline
             for card in result.thesis_cards:
                 self._no_trade_monitor.record_run(had_no_trade=False)
@@ -617,7 +668,7 @@ class WorkflowOrchestrator:
                     self._state.total_trades_entered += 1
                     self._log_activity(
                         "trade", "Execution",
-                        f"Trade #{self._state.total_trades_entered} entered (shadow)",
+                        f"Trade #{self._state.total_trades_entered} entered ({self._current_mode().value})",
                         detail=f"Market: {pipeline_result.market_id}",
                         severity="success",
                     )
@@ -631,6 +682,16 @@ class WorkflowOrchestrator:
             self._log_activity("system", "Pipeline", f"Pipeline error: {str(exc)[:100]}", severity="error")
             self._state.recent_errors.append(
                 f"Pipeline error: {str(exc)[:200]}"
+            )
+            await self._persist_workflow_run(
+                workflow_run_id=run_id,
+                run_type="trigger_based",
+                status="failed",
+                completed_at=datetime.now(tz=UTC),
+                outcome="error",
+                outcome_reason=str(exc)[:500],
+                market_id=candidates[0].market_id if candidates and len(candidates) == 1 else None,
+                operator_mode=self._current_mode().value,
             )
             try:
                 from dashboard_api.app import _add_workflow_run
@@ -647,7 +708,8 @@ class WorkflowOrchestrator:
     async def _process_thesis_card(self, card: Any) -> PipelineResult:
         """Process a thesis card through tradeability → risk → cost → execution.
 
-        In paper/shadow mode, stops before actual execution.
+        In shadow mode, stops before execution.
+        In paper mode, persists a simulated trade.
         """
         market_id = getattr(card, "market_id", "unknown")
         started = datetime.now(tz=UTC)
@@ -663,17 +725,21 @@ class WorkflowOrchestrator:
             parse_input = self._build_resolution_input(card)
             parse_result = self._resolution_parser.parse(parse_input)
 
-            if parse_result.hard_rejected:
+            if parse_result.is_rejected:
                 return PipelineResult(
                     market_id=market_id,
                     stage_reached=PipelineStage.TRADEABILITY,
-                    reason=f"Hard rejection: {parse_result.rejection_reason}",
+                    reason=(
+                        "Hard rejection: "
+                        f"{parse_result.rejection_reason.value if parse_result.rejection_reason else parse_result.rejection_detail}"
+                    ),
                     duration_seconds=(datetime.now(tz=UTC) - started).total_seconds(),
                 )
         except Exception as exc:
             _log.error("tradeability_parse_error", market_id=market_id, error=str(exc))
 
         # --- Stage 2: Risk Governor approval ---
+        risk_assessment = None
         try:
             risk_assessment = self._risk_governor.assess(
                 self._build_sizing_request(card),
@@ -696,11 +762,11 @@ class WorkflowOrchestrator:
                 duration_seconds=(datetime.now(tz=UTC) - started).total_seconds(),
             )
 
-        # --- Stage 3: Paper/Shadow mode → log but don't execute ---
+        # --- Stage 3: Shadow mode → log only ---
         mode = self._current_mode()
-        if mode in (OperatorMode.PAPER, OperatorMode.SHADOW):
+        if mode == OperatorMode.SHADOW:
             _log.info(
-                "paper_mode_trade_decision",
+                "shadow_mode_trade_decision",
                 market_id=market_id,
                 mode=mode.value,
                 message="Trade would be entered in live mode",
@@ -717,11 +783,19 @@ class WorkflowOrchestrator:
                 market_id=market_id,
                 stage_reached=PipelineStage.EXECUTION,
                 accepted=True,
-                reason=f"Paper mode: trade logged, not executed",
+                reason="Shadow mode: trade logged, not executed",
                 duration_seconds=(datetime.now(tz=UTC) - started).total_seconds(),
             )
 
-        # --- Stage 4: Live execution (future) ---
+        # --- Stage 4: Paper mode → persist simulated trade ---
+        if mode == OperatorMode.PAPER:
+            return await self._execute_paper_trade(
+                card,
+                risk_assessment,
+                started=started,
+            )
+
+        # --- Stage 5: Live execution (future) ---
         _log.info(
             "live_execution_pending",
             market_id=market_id,
@@ -762,6 +836,26 @@ class WorkflowOrchestrator:
             _log.info("sweep_skipped_cost", reason=reason)
             return
 
+        sweep_run_id = f"sweep-{uuid.uuid4().hex[:8]}"
+        sweep_started = datetime.now(tz=UTC)
+        await self._persist_workflow_run(
+            workflow_run_id=sweep_run_id,
+            run_type="scheduled_sweep",
+            status="running",
+            started_at=sweep_started,
+            operator_mode=self._current_mode().value,
+        )
+        try:
+            from dashboard_api.app import _add_workflow_run
+            _add_workflow_run(
+                workflow_run_id=sweep_run_id,
+                workflow_type="scheduled_sweep",
+                status="running",
+                started_at=sweep_started,
+            )
+        except Exception:
+            pass
+
         try:
             # Discover active markets
             markets = await self._market_data.discover_markets()
@@ -785,6 +879,8 @@ class WorkflowOrchestrator:
 
             # Build eligibility inputs and evaluate
             eligible_candidates: list[CandidateContext] = []
+            # Collect (market_id_str, elig_result) pairs for DB persistence
+            _elig_decisions_to_persist: list[tuple[str, Any]] = []
             for market in markets_filtered[:50]:  # cap to prevent overload
                 elig_input = MarketEligibilityInput(
                     market_id=market.market_id or str(uuid.uuid4()),
@@ -800,6 +896,7 @@ class WorkflowOrchestrator:
                 )
 
                 result = self._eligibility.evaluate(elig_input)
+                _elig_decisions_to_persist.append((elig_input.market_id, result))
 
                 watchlist_outcomes = {
                     EligibilityOutcome.INVESTIGATE_NOW.value,
@@ -813,12 +910,22 @@ class WorkflowOrchestrator:
                             MarketWatchEntry(
                                 market_id=elig_input.market_id,
                                 token_id=token_id,
+                                title=elig_input.title,
+                                description=elig_input.description,
                                 category=result.category_classification.category or "unknown",
+                                category_quality_tier=result.category_classification.quality_tier,
+                                resolution_source=elig_input.resolution_source,
+                                tags=elig_input.tags,
+                                end_date=elig_input.end_date,
                                 last_spread=elig_input.spread,
                             )
                         )
                     # Only INVESTIGATE_NOW markets become active investigation candidates.
                     if result.outcome == EligibilityOutcome.INVESTIGATE_NOW.value:
+                        # Skip near-certainty markets — no exploitable edge
+                        market_price = market.price or market.mid_price
+                        if market_price is not None and (market_price < 0.04 or market_price > 0.96):
+                            continue
                         eligible_candidates.append(
                             CandidateContext(
                                 market_id=elig_input.market_id,
@@ -827,10 +934,13 @@ class WorkflowOrchestrator:
                                 category=result.category_classification.category or "unknown",
                                 trigger_class="discovery",
                                 trigger_level="C",
-                                price=0.5,
-                                mid_price=0.5,
+                                price=market.price or market.mid_price or 0.5,
+                                mid_price=market.mid_price or market.price or 0.5,
                                 spread=elig_input.spread,
                                 visible_depth_usd=elig_input.liquidity_usd,
+                                description=market.description,
+                                end_date=market.end_date,
+                                end_date_hours=max(0.0, (market.end_date - datetime.now(tz=UTC)).total_seconds() / 3600) if market.end_date else None,
                             )
                         )
 
@@ -841,13 +951,54 @@ class WorkflowOrchestrator:
                 watch_list_size=self._scanner.get_watch_list().__len__(),
             )
 
+            # Persist eligibility decisions to DB (best-effort — don't fail sweep on error)
+            if _elig_decisions_to_persist and self._session_factory is not None:
+                try:
+                    async with self._session_factory() as session:
+                        for ext_market_id, elig_result in _elig_decisions_to_persist:
+                            watch_entry = self._get_watch_entry(market_id=ext_market_id)
+                            market_obj = await self._ensure_market_row(
+                                session,
+                                external_market_id=ext_market_id,
+                                watch_entry=watch_entry,
+                            )
+                            await self._persist_eligibility_decision(
+                                market_obj=market_obj,
+                                result=elig_result,
+                                session=session,
+                            )
+                        await session.commit()
+                except Exception as _elig_exc:
+                    _log.warning("sweep_eligibility_persist_failed", error=str(_elig_exc))
+
             if not eligible_candidates:
                 self._state.total_no_trade_decisions += 1
+                await self._persist_workflow_run(
+                    workflow_run_id=sweep_run_id,
+                    run_type="scheduled_sweep",
+                    status="completed",
+                    completed_at=datetime.now(tz=UTC),
+                    outcome="no_trade",
+                    outcome_reason="No eligible investigate-now candidates",
+                    operator_mode=self._current_mode().value,
+                )
+                try:
+                    from dashboard_api.app import _add_workflow_run
+                    _add_workflow_run(
+                        workflow_run_id=sweep_run_id,
+                        workflow_type="scheduled_sweep",
+                        status="completed",
+                        candidates_reviewed=0,
+                        candidates_accepted=0,
+                        cost_usd=0.0,
+                        started_at=sweep_started,
+                        completed_at=datetime.now(tz=UTC),
+                    )
+                except Exception:
+                    pass
                 return
 
             # Run investigation on top candidates
-            sweep_run_id = f"sweep-{uuid.uuid4().hex[:8]}"
-            sweep_started = datetime.now(tz=UTC)
             request = InvestigationRequest(
                 workflow_run_id=sweep_run_id,
                 mode=InvestigationMode.SCHEDULED_SWEEP,
@@ -855,25 +1006,31 @@ class WorkflowOrchestrator:
                 max_candidates=3,
             )
 
-            try:
-                from dashboard_api.app import _add_workflow_run
-                _add_workflow_run(
-                    workflow_run_id=sweep_run_id,
-                    workflow_type="scheduled_sweep",
-                    status="running",
-                    candidates_reviewed=len(eligible_candidates[:10]),
-                    started_at=sweep_started,
-                )
-            except Exception:
-                pass
-
             self._state.total_investigations += 1
             result = await self._investigator.run(
                 request,
                 regime=self._build_regime_context(),
             )
+            self._record_investigation_spend(sweep_run_id, result)
 
             sweep_cost = getattr(result, "actual_cost_usd", 0.0) or 0.0
+            outcome = "candidate_accepted" if result.thesis_cards else "no_trade"
+            outcome_reason = None
+            if result.no_trade_results:
+                outcome_reason = "; ".join(
+                    nt.reason for nt in result.no_trade_results if getattr(nt, "reason", "")
+                )[:500]
+
+            await self._persist_workflow_run(
+                workflow_run_id=sweep_run_id,
+                run_type="scheduled_sweep",
+                status="completed",
+                completed_at=datetime.now(tz=UTC),
+                actual_cost_usd=sweep_cost,
+                outcome=outcome,
+                outcome_reason=outcome_reason,
+                operator_mode=self._current_mode().value,
+            )
             try:
                 from dashboard_api.app import _add_workflow_run, _record_agent_invocation
                 _add_workflow_run(
@@ -886,8 +1043,9 @@ class WorkflowOrchestrator:
                     started_at=sweep_started,
                     completed_at=datetime.now(tz=UTC),
                 )
-                if sweep_cost > 0:
-                    _record_agent_invocation("investigator_orchestration", sweep_cost)
+                for role, cost in (getattr(result, "agent_costs", None) or {}).items():
+                    if cost > 0:
+                        _record_agent_invocation(role, cost)
             except Exception:
                 pass
 
@@ -896,6 +1054,15 @@ class WorkflowOrchestrator:
 
             if result.no_trade_results:
                 self._state.total_no_trade_decisions += len(result.no_trade_results)
+                # Record investigation cooldowns for all rejected sweep candidates
+                for nt in result.no_trade_results:
+                    nt_market_id = getattr(nt, "market_id", None)
+                    if nt_market_id:
+                        candidate_price = next(
+                            (c.price for c in eligible_candidates if c.market_id == nt_market_id),
+                            None,
+                        )
+                        self._record_investigation_rejection(nt_market_id, candidate_price)
 
             _log.info(
                 "scheduled_sweep_complete",
@@ -905,6 +1072,15 @@ class WorkflowOrchestrator:
             )
 
         except Exception as exc:
+            await self._persist_workflow_run(
+                workflow_run_id=sweep_run_id,
+                run_type="scheduled_sweep",
+                status="failed",
+                completed_at=datetime.now(tz=UTC),
+                outcome="error",
+                outcome_reason=str(exc)[:500],
+                operator_mode=self._current_mode().value,
+            )
             _log.error("scheduled_sweep_error", error=str(exc))
 
     # ================================================================
@@ -1040,11 +1216,13 @@ class WorkflowOrchestrator:
         _log.info("daily_reset_executing")
         self._cost_governor.reset_day()
         self._risk_governor.reset_day(
-            start_of_day_equity=self._portfolio.account_balance_usd
+            start_of_day_equity=self._portfolio.current_equity_usd
         )
 
     async def _run_dashboard_sync(self) -> None:
         """Sync system state to dashboard API."""
+        await self._mark_to_market_paper_positions()
+        await self._refresh_runtime_portfolio_state()
         self._sync_dashboard_state()
 
     # ================================================================
@@ -1067,44 +1245,323 @@ class WorkflowOrchestrator:
             operator_mode=self._current_mode(),
         )
 
+    def _record_investigation_spend(self, workflow_run_id: str, result: Any) -> None:
+        """Record aggregate investigation spend into the Cost Governor."""
+        if self._cost_governor is None:
+            return
+
+        actual_cost = float(getattr(result, "actual_cost_usd", 0.0) or 0.0)
+        if actual_cost <= 0:
+            return
+
+        models_used = [
+            str(model).lower()
+            for model in (getattr(result, "models_used", None) or [])
+        ]
+        if any("opus" in model for model in models_used):
+            tier = ModelTier.A
+            cost_class = CostClass.H
+            provider = "openrouter"
+        elif any("sonnet" in model for model in models_used):
+            tier = ModelTier.B
+            cost_class = CostClass.M
+            provider = "openrouter"
+        else:
+            tier = ModelTier.C
+            cost_class = CostClass.L
+            provider = "openai"
+
+        model_name = models_used[0] if models_used else "aggregate_investigation"
+        self._cost_governor.record_spend(
+            CostRecordInput(
+                workflow_run_id=workflow_run_id,
+                agent_role="investigation_workflow",
+                model=model_name,
+                provider=provider,
+                tier=tier,
+                cost_class=cost_class,
+                input_tokens=0,
+                output_tokens=0,
+                estimated_cost_usd=actual_cost,
+                actual_cost_usd=actual_cost,
+            )
+        )
+        self._sync_dashboard_state()
+
+    def _get_watch_entry(
+        self,
+        *,
+        token_id: str | None = None,
+        market_id: str | None = None,
+    ) -> MarketWatchEntry | None:
+        """Resolve market metadata from the scanner watch list."""
+        if self._scanner is None:
+            return None
+        if token_id:
+            entry = self._scanner.get_watch_entry(token_id)
+            if entry is not None:
+                return entry
+        if market_id:
+            return self._scanner.get_watch_entry_by_market(market_id)
+        return None
+
+    async def _load_market_catalog(self) -> None:
+        """Populate a lightweight market metadata cache from Gamma."""
+        if self._market_data is None or self._market_catalog:
+            return
+
+        try:
+            markets = await self._market_data.discover_markets()
+        except Exception as exc:
+            _log.warning("market_catalog_refresh_failed", error=str(exc))
+            return
+
+        self._market_catalog = {m.market_id: m for m in markets}
+        if self._scanner is None:
+            return
+
+        for market in markets:
+            for token_id in market.token_ids:
+                entry = self._scanner.get_watch_entry(token_id)
+                if entry is None:
+                    continue
+                if not entry.title:
+                    entry.title = market.title
+                if not entry.description:
+                    entry.description = market.description
+                if not entry.category:
+                    entry.category = market.category
+                if not entry.tags:
+                    entry.tags = market.tags
+                if not entry.resolution_source:
+                    entry.resolution_source = market.resolution_source
+                if entry.end_date is None:
+                    entry.end_date = market.end_date
+
+    # --- Investigation cooldown constants ---
+    _INVESTIGATION_COOLDOWN_HOURS: float = 3.0   # don't re-investigate within 3 hours
+    _INVESTIGATION_COOLDOWN_PRICE_BAND: float = 0.04  # unless price moved > 4%
+
+    def _is_in_investigation_cooldown(
+        self, market_id: str, current_price: float | None
+    ) -> bool:
+        """Return True if this market was recently rejected and price hasn't moved enough."""
+        entry = self._investigation_cooldown.get(market_id)
+        if entry is None:
+            return False
+        rejected_at, rejected_price = entry
+        hours_elapsed = (datetime.now(tz=UTC) - rejected_at).total_seconds() / 3600
+        if hours_elapsed >= self._INVESTIGATION_COOLDOWN_HOURS:
+            del self._investigation_cooldown[market_id]
+            return False
+        if current_price is not None and abs(current_price - rejected_price) > self._INVESTIGATION_COOLDOWN_PRICE_BAND:
+            return False  # Price moved significantly — allow re-investigation
+        return True
+
+    def _record_investigation_rejection(self, market_id: str, price: float | None) -> None:
+        """Record that a market was rejected by investigation at this price."""
+        self._investigation_cooldown[market_id] = (datetime.now(tz=UTC), price or 0.5)
+
+    async def _build_candidate_from_trigger(self, trigger: Any) -> CandidateContext | None:
+        """Build a trigger-based candidate with real market metadata."""
+        watch_entry = self._get_watch_entry(token_id=trigger.token_id, market_id=trigger.market_id)
+        if watch_entry is None or not watch_entry.category or not watch_entry.title:
+            await self._load_market_catalog()
+            watch_entry = self._get_watch_entry(token_id=trigger.token_id, market_id=trigger.market_id)
+
+        market_info = self._market_catalog.get(trigger.market_id or "")
+        category = (
+            (watch_entry.category if watch_entry else None)
+            or (market_info.category if market_info else None)
+            or "unknown"
+        )
+        title = (
+            (watch_entry.title if watch_entry else None)
+            or (market_info.title if market_info else None)
+            or (trigger.reason or trigger.market_id or trigger.token_id)
+        )
+        description = (
+            (watch_entry.description if watch_entry else None)
+            or (market_info.description if market_info else None)
+        )
+        end_date = (
+            (watch_entry.end_date if watch_entry else None)
+            or (market_info.end_date if market_info else None)
+        )
+        visible_depth = (
+            (trigger.depth_snapshot or {}).get("top3_usd")
+            or (watch_entry.last_depth_top3 if watch_entry else None)
+            or (market_info.liquidity if market_info else None)
+            or 0.0
+        )
+
+        end_date_hours = None
+        if end_date is not None:
+            end_date_hours = max(
+                0.0,
+                (end_date - datetime.now(tz=UTC)).total_seconds() / 3600.0,
+            )
+
+        category_quality_tier = (
+            (watch_entry.category_quality_tier if watch_entry else None)
+            or ("quality_gated" if category == "sports" else "standard")
+        )
+
+        # --- Pre-filter 1: Price at extreme (near certainty — no exploitable edge) ---
+        current_price = trigger.price or (watch_entry.last_price if watch_entry else None)
+        if current_price is not None and (current_price < 0.04 or current_price > 0.96):
+            _log.info(
+                "candidate_skipped_price_extreme",
+                market_id=trigger.market_id,
+                price=current_price,
+            )
+            return None
+
+        # --- Pre-filter 2: Sports short-horizon (quality-gated markets < 7 days) ---
+        if category_quality_tier == "quality_gated" and end_date_hours is not None and end_date_hours < 168:
+            _log.info(
+                "candidate_skipped_sports_short_horizon",
+                market_id=trigger.market_id,
+                hours_remaining=end_date_hours,
+            )
+            return None
+
+        # --- Pre-filter 3: Investigation cooldown ---
+        if self._is_in_investigation_cooldown(trigger.market_id or trigger.token_id, current_price):
+            _log.debug(
+                "candidate_skipped_investigation_cooldown",
+                market_id=trigger.market_id,
+            )
+            return None
+
+        return CandidateContext(
+            market_id=trigger.market_id or trigger.token_id,
+            token_id=trigger.token_id,
+            title=title,
+            description=description,
+            category=category,
+            category_quality_tier=category_quality_tier,
+            tags=list((watch_entry.tags if watch_entry else None) or (market_info.tags if market_info else []) or []),
+            trigger_class=trigger.trigger_class,
+            trigger_level=trigger.trigger_level,
+            trigger_reason=trigger.reason or "",
+            price=trigger.price or (watch_entry.last_price if watch_entry else None) or 0.5,
+            mid_price=trigger.price or (watch_entry.last_price if watch_entry else None) or 0.5,
+            spread=trigger.spread if trigger.spread is not None else (watch_entry.last_spread if watch_entry else None),
+            visible_depth_usd=float(visible_depth),
+            eligibility_outcome=EligibilityOutcome.TRIGGER_ELIGIBLE.value,
+            resolution_source=(
+                (watch_entry.resolution_source if watch_entry else None)
+                or (market_info.resolution_source if market_info else None)
+            ),
+            end_date=end_date,
+            end_date_hours=end_date_hours,
+        )
+
+    def _infer_visible_depth(self, card: Any) -> float:
+        """Infer visible depth when only a liquidity-adjusted max size is available."""
+        explicit = getattr(card, "visible_depth_usd", None)
+        if explicit:
+            return float(explicit)
+
+        max_size = getattr(card, "liquidity_adjusted_max_size_usd", None)
+        if max_size:
+            return float(max_size) / max(self._config.risk.max_order_depth_fraction, 0.01)
+        return 0.0
+
     def _build_resolution_input(self, card: Any) -> Any:
-        """Build resolution parse input from a thesis card."""
+        """Build resolution parse input from watch-list market metadata."""
         from tradeability.types import ResolutionParseInput
+
+        watch_entry = self._get_watch_entry(market_id=getattr(card, "market_id", ""))
+        title = (watch_entry.title if watch_entry else None) or getattr(card, "core_thesis", "") or getattr(card, "market_id", "")
+        description = (
+            (watch_entry.description if watch_entry else None)
+            or getattr(card, "resolution_interpretation", None)
+            or getattr(card, "why_mispriced", None)
+        )
+        resolution_source = (
+            (watch_entry.resolution_source if watch_entry else None)
+            or getattr(card, "resolution_source_language", None)
+        )
         return ResolutionParseInput(
             market_id=getattr(card, "market_id", ""),
-            title=getattr(card, "title", ""),
-            description=getattr(card, "description", ""),
-            resolution_source=getattr(card, "resolution_source", ""),
-            end_date=getattr(card, "end_date", None),
+            title=title,
+            description=description,
+            resolution_source=resolution_source,
+            resolution_deadline=watch_entry.end_date if watch_entry else None,
+            end_date_hours=(
+                max(
+                    0.0,
+                    (watch_entry.end_date - datetime.now(tz=UTC)).total_seconds() / 3600.0,
+                )
+                if watch_entry and watch_entry.end_date is not None
+                else None
+            ),
+            spread=(watch_entry.last_spread if watch_entry else None) or getattr(card, "expected_friction_spread", None),
+            depth_usd=(watch_entry.last_depth_top3 if watch_entry else None) or self._infer_visible_depth(card),
+            min_position_size_usd=self._config.tradeability.min_depth_for_min_position_usd,
         )
 
     def _build_sizing_request(self, card: Any) -> Any:
-        """Build a sizing request from a thesis card."""
+        """Build a valid Risk Governor sizing request from a thesis card."""
         from risk.types import SizingRequest
+
+        watch_entry = self._get_watch_entry(market_id=getattr(card, "market_id", ""))
+        quality_tier = getattr(card, "category_quality_tier", "standard") or "standard"
+        try:
+            category_quality_tier = CategoryQualityTier(quality_tier)
+        except ValueError:
+            category_quality_tier = CategoryQualityTier.STANDARD
+
+        rubric = getattr(card, "rubric_score", None)
+        probability_estimate = (
+            getattr(card, "probability_estimate", None)
+            or getattr(card, "calibrated_probability", None)
+            or getattr(card, "market_implied_probability", None)
+            or 0.5
+        )
+
         return SizingRequest(
             market_id=getattr(card, "market_id", ""),
+            token_id=watch_entry.token_id if watch_entry else "",
             category=getattr(card, "category", "unknown"),
-            proposed_side=getattr(card, "proposed_side", "yes"),
-            proposed_price=getattr(card, "entry_price", 0.5),
-            estimated_probability=getattr(card, "calibrated_probability", 0.5),
-            gross_edge=getattr(card, "expected_gross_edge", 0.0),
-            evidence_score=getattr(card, "evidence_quality_score", 0.5),
-            ambiguity_score=getattr(card, "ambiguity_score", 0.0),
-            correlation_tags=[],
+            category_quality_tier=category_quality_tier,
+            gross_edge=getattr(card, "gross_edge", 0.0) or 0.0,
+            net_edge_after_cost=getattr(card, "net_edge_after_cost", None),
+            probability_estimate=probability_estimate,
+            confidence_estimate=getattr(card, "confidence_estimate", 0.5) or 0.5,
+            calibration_confidence=getattr(card, "calibration_confidence", 0.5) or 0.5,
+            evidence_quality_score=getattr(card, "evidence_quality_score", 0.5) or 0.5,
+            evidence_diversity_score=getattr(card, "evidence_diversity_score", 0.5) or 0.5,
+            ambiguity_score=getattr(card, "ambiguity_score", 0.0) or 0.0,
+            visible_depth_usd=(watch_entry.last_depth_top3 if watch_entry else None) or self._infer_visible_depth(card),
+            spread=(watch_entry.last_spread if watch_entry else None) or getattr(card, "expected_friction_spread", None),
+            correlation_burden_score=(
+                getattr(rubric, "cluster_correlation_burden", 0.0) if rubric is not None else 0.0
+            ),
+            category_resolved_trades=0,
         )
 
     def _record_shadow_forecast(self, card: Any) -> None:
         """Record a shadow forecast to the calibration store."""
         try:
             from calibration.types import ShadowForecastInput
+
             forecast = ShadowForecastInput(
                 market_id=getattr(card, "market_id", ""),
+                workflow_run_id=getattr(card, "workflow_run_id", None),
                 category=getattr(card, "category", "unknown"),
                 system_probability=getattr(card, "calibrated_probability", 0.5),
                 market_implied_probability=getattr(card, "market_implied_probability", 0.5),
+                thesis_context={
+                    "proposed_side": getattr(card, "proposed_side", None),
+                    "core_thesis": getattr(card, "core_thesis", None),
+                    "net_edge_after_cost": getattr(card, "net_edge_after_cost", None),
+                },
                 forecast_at=datetime.now(tz=UTC),
             )
-            self._calibration_store.record(forecast)
+            self._calibration_store.record_forecast(forecast)
 
             _log.info(
                 "shadow_forecast_recorded",
@@ -1115,6 +1572,581 @@ class WorkflowOrchestrator:
         except Exception as exc:
             _log.error("shadow_forecast_error", error=str(exc))
 
+    def _paper_unrealized_pnl(
+        self,
+        side: str,
+        size: float,
+        entry_price: float,
+        current_price: float,
+    ) -> float:
+        """Compute paper PnL using the repo's position-size convention."""
+        if side == "no":
+            return round(size * (entry_price - current_price), 2)
+        return round(size * (current_price - entry_price), 2)
+
+    async def _refresh_runtime_portfolio_state(self) -> None:
+        """Keep the in-memory portfolio aligned with dashboard state and DB."""
+        self._portfolio.operator_mode = self._current_mode()
+
+        base_equity = (
+            float(self._dashboard_state.get("paper_balance_usd", self._config.paper_balance_usd))
+            if self._dashboard_state is not None
+            else float(self._config.paper_balance_usd)
+        )
+        start_of_day = (
+            float(self._dashboard_state.get("start_of_day_equity_usd", base_equity))
+            if self._dashboard_state is not None
+            else base_equity
+        )
+
+        self._portfolio.account_balance_usd = base_equity
+        self._portfolio.start_of_day_equity_usd = start_of_day
+
+        if self._session_factory is None:
+            self._portfolio.current_equity_usd = base_equity
+            return
+
+        from data.models import Market, Position
+
+        async with self._session_factory() as session:
+            open_result = await session.execute(
+                select(Position.size, Position.unrealized_pnl, Market.category)
+                .join(Market, Position.market_id == Market.id)
+                .where(Position.status == "open")
+            )
+            rows = open_result.all()
+
+            realized_result = await session.execute(
+                select(func.coalesce(func.sum(Position.realized_pnl), 0.0))
+            )
+            total_realized = float(realized_result.scalar_one() or 0.0)
+
+        total_open_exposure = 0.0
+        total_unrealized = 0.0
+        category_exposure: dict[str, float] = {}
+        for size, unrealized, category in rows:
+            size_value = float(size or 0.0)
+            total_open_exposure += size_value
+            total_unrealized += float(unrealized or 0.0)
+            cat = category or "unknown"
+            category_exposure[cat] = category_exposure.get(cat, 0.0) + size_value
+
+        self._portfolio.total_open_exposure_usd = round(total_open_exposure, 2)
+        self._portfolio.open_position_count = len(rows)
+        self._portfolio.category_exposure_usd = category_exposure
+        self._portfolio.current_equity_usd = round(
+            base_equity + total_realized + total_unrealized,
+            2,
+        )
+        if self._risk_governor is not None:
+            self._risk_governor.update_equity(self._portfolio.current_equity_usd)
+
+    async def _mark_to_market_paper_positions(self) -> None:
+        """Update open paper positions with the latest watched-market prices."""
+        if self._session_factory is None or self._current_mode() != OperatorMode.PAPER:
+            return
+        if self._scanner is None:
+            return
+
+        held_entries = [
+            entry for entry in self._scanner.get_watch_list()
+            if entry.is_held_position and entry.position_id and entry.last_price is not None
+        ]
+        if not held_entries:
+            return
+
+        from data.models import Market, Position
+
+        updated = False
+        async with self._session_factory() as session:
+            for entry in held_entries:
+                try:
+                    position = await session.get(Position, uuid.UUID(entry.position_id))
+                except (TypeError, ValueError):
+                    continue
+                if position is None or position.status != "open":
+                    continue
+
+                current_price = float(entry.last_price)
+                position.current_price = current_price
+                position.unrealized_pnl = self._paper_unrealized_pnl(
+                    position.side,
+                    float(position.remaining_size or position.size),
+                    float(position.entry_price),
+                    current_price,
+                )
+                updated = True
+
+                market_stmt = select(Market).where(Market.market_id == entry.market_id)
+                market = (await session.execute(market_stmt)).scalar_one_or_none()
+                if market is not None:
+                    market.last_price = current_price
+                    market.last_spread = entry.last_spread
+                    market.last_snapshot_at = datetime.now(tz=UTC)
+
+            if updated:
+                await session.commit()
+
+    async def _ensure_market_row(
+        self,
+        session: Any,
+        *,
+        external_market_id: str,
+        watch_entry: MarketWatchEntry | None = None,
+        card: Any | None = None,
+    ) -> Any:
+        """Create or refresh a Market ORM row from scanner/thesis metadata."""
+        from data.models import Market
+
+        stmt = select(Market).where(Market.market_id == external_market_id)
+        market = (await session.execute(stmt)).scalar_one_or_none()
+
+        category = (
+            (watch_entry.category if watch_entry else None)
+            or getattr(card, "category", None)
+        )
+        title = (
+            (watch_entry.title if watch_entry else None)
+            or getattr(card, "core_thesis", None)
+            or external_market_id
+        )
+        description = (
+            (watch_entry.description if watch_entry else None)
+            or getattr(card, "resolution_interpretation", None)
+        )
+
+        if market is None:
+            market = Market(
+                market_id=external_market_id,
+                title=title,
+                description=description,
+                category=category,
+                category_quality_tier=(
+                    (watch_entry.category_quality_tier if watch_entry else None)
+                    or getattr(card, "category_quality_tier", None)
+                ),
+                resolution_source=(
+                    (watch_entry.resolution_source if watch_entry else None)
+                    or getattr(card, "resolution_source_language", None)
+                ),
+                resolution_deadline=watch_entry.end_date if watch_entry else None,
+                market_status="active",
+                is_active=True,
+                last_price=(watch_entry.last_price if watch_entry else None) or getattr(card, "market_implied_probability", None),
+                last_spread=(watch_entry.last_spread if watch_entry else None),
+                tags=(watch_entry.tags if watch_entry else None),
+            )
+            session.add(market)
+            await session.flush()
+            return market
+
+        if title and market.title != title:
+            market.title = title
+        if description and not market.description:
+            market.description = description
+        if category and not market.category:
+            market.category = category
+        if watch_entry and watch_entry.category_quality_tier:
+            market.category_quality_tier = watch_entry.category_quality_tier
+        if watch_entry and watch_entry.resolution_source and not market.resolution_source:
+            market.resolution_source = watch_entry.resolution_source
+        if watch_entry and watch_entry.end_date and market.resolution_deadline is None:
+            market.resolution_deadline = watch_entry.end_date
+        if watch_entry and watch_entry.tags and not market.tags:
+            market.tags = watch_entry.tags
+        if watch_entry and watch_entry.last_price is not None:
+            market.last_price = watch_entry.last_price
+        if watch_entry and watch_entry.last_spread is not None:
+            market.last_spread = watch_entry.last_spread
+            market.last_snapshot_at = datetime.now(tz=UTC)
+        return market
+
+    async def _persist_eligibility_decision(
+        self,
+        *,
+        market_obj: Any,
+        result: Any,
+        session: Any,
+    ) -> None:
+        """Persist an eligibility decision to the eligibility_decisions DB table."""
+        from data.models.workflow import EligibilityDecision
+
+        decision = EligibilityDecision(
+            market_id=market_obj.id,
+            outcome=result.outcome,
+            reason_code=result.reason_code,
+            reason_detail=getattr(result, "reason_detail", None),
+            rule_version=getattr(result, "rule_version", None),
+            decided_at=datetime.now(tz=UTC),
+        )
+        session.add(decision)
+
+    async def _persist_trigger_events(self, triggers: list[Any]) -> None:
+        """Persist scanner trigger history to the DB for dashboard queries."""
+        if not triggers or self._session_factory is None:
+            return
+
+        from data.models.workflow import TriggerEvent
+
+        async with self._session_factory() as session:
+            for trigger in triggers:
+                watch_entry = self._get_watch_entry(token_id=trigger.token_id, market_id=trigger.market_id)
+                market = await self._ensure_market_row(
+                    session,
+                    external_market_id=trigger.market_id or trigger.token_id,
+                    watch_entry=watch_entry,
+                )
+                session.add(
+                    TriggerEvent(
+                        market_id=market.id,
+                        trigger_class=trigger.trigger_class.value if hasattr(trigger.trigger_class, "value") else str(trigger.trigger_class),
+                        trigger_level=trigger.trigger_level.value if hasattr(trigger.trigger_level, "value") else str(trigger.trigger_level),
+                        price_at_trigger=trigger.price,
+                        spread_at_trigger=trigger.spread,
+                        depth_snapshot=trigger.depth_snapshot,
+                        data_source=getattr(trigger, "data_source", "live"),
+                        reason=trigger.reason or "",
+                        escalation_status=getattr(trigger, "escalation_status", None),
+                        triggered_at=getattr(trigger, "detected_at", datetime.now(tz=UTC)),
+                    )
+                )
+            await session.commit()
+
+    async def _persist_workflow_run(
+        self,
+        *,
+        workflow_run_id: str,
+        run_type: str,
+        status: str,
+        market_id: str | None = None,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
+        actual_cost_usd: float | None = None,
+        outcome: str | None = None,
+        outcome_reason: str | None = None,
+        operator_mode: str | None = None,
+    ) -> None:
+        """Persist workflow run lifecycle events to the DB."""
+        if self._session_factory is None:
+            return
+
+        from data.models.workflow import WorkflowRun
+
+        async with self._session_factory() as session:
+            stmt = select(WorkflowRun).where(WorkflowRun.workflow_run_id == workflow_run_id)
+            run = (await session.execute(stmt)).scalar_one_or_none()
+            watch_entry = self._get_watch_entry(market_id=market_id) if market_id else None
+            market = None
+            if market_id:
+                market = await self._ensure_market_row(
+                    session,
+                    external_market_id=market_id,
+                    watch_entry=watch_entry,
+                )
+
+            if run is None:
+                run = WorkflowRun(
+                    workflow_run_id=workflow_run_id,
+                    run_type=run_type,
+                    market_id=market.id if market is not None else None,
+                    status=status,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    actual_cost_usd=actual_cost_usd,
+                    outcome=outcome,
+                    outcome_reason=outcome_reason,
+                    operator_mode=operator_mode,
+                )
+                session.add(run)
+            else:
+                run.run_type = run_type
+                run.status = status
+                if market is not None:
+                    run.market_id = market.id
+                if started_at is not None and run.started_at is None:
+                    run.started_at = started_at
+                if completed_at is not None:
+                    run.completed_at = completed_at
+                if actual_cost_usd is not None:
+                    run.actual_cost_usd = actual_cost_usd
+                if outcome is not None:
+                    run.outcome = outcome
+                if outcome_reason is not None:
+                    run.outcome_reason = outcome_reason
+                if operator_mode is not None:
+                    run.operator_mode = operator_mode
+
+            await session.commit()
+
+    async def _execute_paper_trade(
+        self,
+        card: Any,
+        risk_assessment: Any,
+        *,
+        started: datetime,
+    ) -> PipelineResult:
+        """Persist a simulated paper trade so the dashboard can track it."""
+        if self._session_factory is None:
+            return PipelineResult(
+                market_id=getattr(card, "market_id", "unknown"),
+                stage_reached=PipelineStage.EXECUTION,
+                reason="Paper execution unavailable: no session factory",
+                duration_seconds=(datetime.now(tz=UTC) - started).total_seconds(),
+            )
+
+        watch_entry = self._get_watch_entry(market_id=getattr(card, "market_id", ""))
+        token_id = watch_entry.token_id if watch_entry else ""
+        price = (
+            (watch_entry.last_price if watch_entry else None)
+            or getattr(card, "market_implied_probability", None)
+            or getattr(card, "calibrated_probability", None)
+            or 0.5
+        )
+        current_depth = (watch_entry.last_depth_top3 if watch_entry else None) or self._infer_visible_depth(card)
+        size_usd = risk_assessment.sizing.recommended_size_usd if risk_assessment.sizing is not None else 0.0
+
+        if size_usd <= 0:
+            return PipelineResult(
+                market_id=getattr(card, "market_id", "unknown"),
+                stage_reached=PipelineStage.EXECUTION,
+                reason="Paper execution rejected: recommended size is zero",
+                duration_seconds=(datetime.now(tz=UTC) - started).total_seconds(),
+            )
+
+        execution_request = ExecutionRequest(
+            workflow_run_id=getattr(card, "workflow_run_id", ""),
+            market_id=getattr(card, "market_id", ""),
+            token_id=token_id,
+            side="buy",
+            price=float(price),
+            size_usd=float(size_usd),
+            current_spread=(watch_entry.last_spread if watch_entry else None) or getattr(card, "expected_friction_spread", None),
+            current_depth_usd=float(current_depth or 0.0),
+            current_mid_price=float(price),
+            market_status="active",
+            risk_approval=risk_assessment.approval.value,
+            risk_conditions=risk_assessment.special_conditions,
+            cost_approval="approved",
+            tradeability_outcome="tradable_normal",
+            entry_impact_bps=getattr(card, "entry_impact_estimate_bps", 0.0) or 0.0,
+            gross_edge=getattr(card, "gross_edge", 0.0) or 0.0,
+            liquidity_relative_size_pct=(
+                float(size_usd) / float(current_depth)
+                if current_depth
+                else 0.0
+            ),
+            preferred_entry_mode=EntryMode.IMMEDIATE,
+            drawdown_level=risk_assessment.drawdown_state.level.value,
+            operator_mode=self._current_mode().value,
+            approved_at=datetime.now(tz=UTC),
+            max_spread=self._config.tradeability.max_spread,
+            max_order_depth_fraction=self._config.risk.max_order_depth_fraction,
+            max_entry_impact_edge_fraction=self._config.risk.max_entry_impact_edge_fraction,
+        )
+
+        execution_result = await self._execution_engine.execute(
+            execution_request,
+            portfolio_drawdown_pct=self._risk_governor.drawdown_state.current_drawdown_pct,
+            portfolio_open_positions=self._portfolio.open_position_count,
+            portfolio_exposure_usd=self._portfolio.total_open_exposure_usd,
+            account_balance_usd=self._portfolio.account_balance_usd,
+        )
+
+        if execution_result.outcome != ExecutionOutcome.EXECUTED:
+            return PipelineResult(
+                market_id=getattr(card, "market_id", "unknown"),
+                stage_reached=PipelineStage.EXECUTION,
+                reason=execution_result.rejection_reason or "Paper execution rejected",
+                duration_seconds=(datetime.now(tz=UTC) - started).total_seconds(),
+            )
+
+        self._record_shadow_forecast(card)
+
+        from data.models import Order, Position, Trade
+        from data.models.thesis import ThesisCard
+        from data.models.workflow import WorkflowRun
+
+        async with self._session_factory() as session:
+            market = await self._ensure_market_row(
+                session,
+                external_market_id=getattr(card, "market_id", ""),
+                watch_entry=watch_entry,
+                card=card,
+            )
+
+            workflow_stmt = select(WorkflowRun).where(
+                WorkflowRun.workflow_run_id == getattr(card, "workflow_run_id", "")
+            )
+            workflow_run = (await session.execute(workflow_stmt)).scalar_one_or_none()
+            if workflow_run is None:
+                workflow_run_id = getattr(card, "workflow_run_id", "")
+                workflow_run_type = "scheduled_sweep"
+                if workflow_run_id.startswith("trig-"):
+                    workflow_run_type = "trigger_based"
+                elif workflow_run_id.startswith("op-"):
+                    workflow_run_type = "operator_forced"
+                workflow_run = WorkflowRun(
+                    workflow_run_id=workflow_run_id,
+                    run_type=workflow_run_type,
+                    market_id=market.id,
+                    status="completed",
+                    started_at=started,
+                    completed_at=datetime.now(tz=UTC),
+                    outcome="candidate_accepted",
+                    operator_mode=self._current_mode().value,
+                    actual_cost_usd=getattr(card, "expected_inference_cost_usd", 0.0),
+                )
+                session.add(workflow_run)
+                await session.flush()
+
+            thesis_card = ThesisCard(
+                market_id=market.id,
+                workflow_run_id=workflow_run.id,
+                category=getattr(card, "category", "unknown"),
+                category_quality_tier=getattr(card, "category_quality_tier", "standard"),
+                proposed_side=getattr(card, "proposed_side", "yes"),
+                resolution_interpretation=getattr(card, "resolution_interpretation", "") or "",
+                resolution_source_language=getattr(card, "resolution_source_language", None),
+                core_thesis=getattr(card, "core_thesis", "") or "",
+                why_mispriced=getattr(card, "why_mispriced", "") or "",
+                supporting_evidence=getattr(card, "supporting_evidence", []) or [],
+                opposing_evidence=getattr(card, "opposing_evidence", []) or [],
+                expected_catalyst=getattr(card, "expected_catalyst", None),
+                expected_time_horizon=getattr(card, "expected_time_horizon", None),
+                expected_time_horizon_hours=getattr(card, "expected_time_horizon_hours", None),
+                invalidation_conditions=getattr(card, "invalidation_conditions", []) or [],
+                resolution_risk_summary=getattr(card, "resolution_risk_summary", None),
+                market_structure_summary=getattr(card, "market_structure_summary", None),
+                evidence_quality_score=getattr(card, "evidence_quality_score", None),
+                evidence_diversity_score=getattr(card, "evidence_diversity_score", None),
+                ambiguity_score=getattr(card, "ambiguity_score", None),
+                calibration_source_status=getattr(card, "calibration_source_status", None),
+                raw_model_probability=getattr(card, "raw_model_probability", None),
+                calibrated_probability=getattr(card, "calibrated_probability", None),
+                calibration_segment_label=getattr(card, "calibration_segment_label", None),
+                probability_estimate=getattr(card, "probability_estimate", None),
+                confidence_estimate=getattr(card, "confidence_estimate", None),
+                calibration_confidence=getattr(card, "calibration_confidence", None),
+                confidence_note=getattr(card, "confidence_note", None),
+                gross_edge=getattr(card, "gross_edge", None),
+                friction_adjusted_edge=getattr(card, "friction_adjusted_edge", None),
+                impact_adjusted_edge=getattr(card, "impact_adjusted_edge", None),
+                net_edge_after_cost=getattr(card, "net_edge_after_cost", None),
+                expected_friction_spread=getattr(card, "expected_friction_spread", None),
+                expected_friction_slippage=getattr(card, "expected_friction_slippage", None),
+                entry_impact_estimate_bps=getattr(card, "entry_impact_estimate_bps", None),
+                expected_inference_cost_usd=getattr(card, "expected_inference_cost_usd", None),
+                recommended_size_band=getattr(card, "recommended_size_band", None),
+                urgency_of_entry=getattr(card, "urgency_of_entry", None),
+                liquidity_adjusted_max_size=getattr(card, "liquidity_adjusted_max_size_usd", None),
+                trigger_source=getattr(card, "trigger_source", None),
+                market_implied_probability=getattr(card, "market_implied_probability", None),
+                base_rate=getattr(card, "base_rate", None),
+                base_rate_deviation=getattr(card, "base_rate_deviation", None),
+            )
+            session.add(thesis_card)
+            await session.flush()
+
+            position = Position(
+                market_id=market.id,
+                thesis_card_id=thesis_card.id,
+                side=getattr(card, "proposed_side", "yes"),
+                entry_price=float(execution_result.submitted_price or price),
+                current_price=float(execution_result.submitted_price or price),
+                size=float(execution_result.submitted_size or size_usd),
+                remaining_size=float(execution_result.submitted_size or size_usd),
+                status="open",
+                entered_at=execution_result.executed_at,
+                entry_mode=execution_result.entry_mode.value if execution_result.entry_mode else None,
+                review_tier="new",
+                unrealized_pnl=0.0,
+                realized_pnl=0.0,
+                total_inference_cost_usd=float(getattr(card, "expected_inference_cost_usd", 0.0) or 0.0),
+                probability_estimate=getattr(card, "probability_estimate", None),
+                confidence_estimate=getattr(card, "confidence_estimate", None),
+                calibration_confidence=getattr(card, "calibration_confidence", None),
+                risk_approval=risk_assessment.approval.value,
+            )
+            session.add(position)
+            await session.flush()
+
+            order = Order(
+                position_id=position.id,
+                workflow_run_id=workflow_run.id,
+                order_type=execution_request.order_type,
+                side=execution_request.side,
+                price=float(execution_result.submitted_price or price),
+                size=float(execution_result.submitted_size or size_usd),
+                status="filled",
+                submitted_at=execution_result.executed_at,
+                filled_at=execution_result.executed_at,
+                fill_price=float(execution_result.submitted_price or price),
+                filled_size=float(execution_result.submitted_size or size_usd),
+                revalidation_passed=True,
+                revalidation_details=(
+                    execution_result.revalidation.model_dump(mode="json")
+                    if execution_result.revalidation is not None
+                    else None
+                ),
+                estimated_impact_bps=execution_result.entry_impact_bps,
+                approval_chain=execution_result.approval_chain,
+            )
+            session.add(order)
+            await session.flush()
+
+            trade = Trade(
+                order_id=order.id,
+                position_id=position.id,
+                price=float(execution_result.submitted_price or price),
+                size=float(execution_result.submitted_size or size_usd),
+                side=execution_request.side,
+                executed_at=execution_result.executed_at,
+                fee_usd=0.0,
+            )
+            session.add(trade)
+
+            workflow_run.position_id = position.id
+            workflow_run.outcome = "candidate_accepted"
+            workflow_run.completed_at = datetime.now(tz=UTC)
+            workflow_run.actual_cost_usd = float(getattr(card, "expected_inference_cost_usd", 0.0) or 0.0)
+            await session.commit()
+
+        if self._scanner is not None:
+            if watch_entry is not None:
+                self._scanner.update_watch_entry(
+                    watch_entry.token_id,
+                    is_held_position=True,
+                    position_id=str(position.id),
+                    last_price=float(execution_result.submitted_price or price),
+                )
+            elif token_id:
+                self._scanner.add_to_watch_list(
+                    MarketWatchEntry(
+                        market_id=getattr(card, "market_id", ""),
+                        token_id=token_id,
+                        title=getattr(card, "core_thesis", "") or getattr(card, "market_id", ""),
+                        category=getattr(card, "category", "unknown"),
+                        category_quality_tier=getattr(card, "category_quality_tier", "standard"),
+                        is_held_position=True,
+                        position_id=str(position.id),
+                        last_price=float(execution_result.submitted_price or price),
+                    )
+                )
+
+        await self._refresh_runtime_portfolio_state()
+        await self._emit_trade_entry_event(card, paper_mode=True)
+
+        return PipelineResult(
+            market_id=getattr(card, "market_id", "unknown"),
+            stage_reached=PipelineStage.EXECUTION,
+            accepted=True,
+            thesis_card_id=str(thesis_card.id),
+            execution_id=str(order.id),
+            reason="Paper mode: simulated trade executed",
+            total_cost_usd=float(getattr(card, "expected_inference_cost_usd", 0.0) or 0.0),
+            duration_seconds=(datetime.now(tz=UTC) - started).total_seconds(),
+        )
+
     def _sync_dashboard_state(self) -> None:
         """Push current system state to the dashboard API module.
 
@@ -1124,28 +2156,67 @@ class WorkflowOrchestrator:
         """
         try:
             from dashboard_api.app import _system_state
+        except Exception as exc:
+            _log.debug("dashboard_sync_error", error=str(exc))
+            return
 
-            _system_state["system_status"] = self._state.phase.value
-            _system_state["agents_running"] = self._state.phase == SystemPhase.RUNNING
+        _system_state["system_status"] = self._state.phase.value
+        _system_state["agents_running"] = self._state.phase == SystemPhase.RUNNING
 
-            if self._scanner:
+        if self._scanner:
+            try:
                 health = self._scanner.health_monitor.get_health_status()
-                _system_state["scanner_api_status"] = "healthy" if health.api_available else "degraded"
-                _system_state["scanner_degraded_level"] = health.degraded_mode_level.value
+                _system_state["scanner_api_status"] = (
+                    "healthy" if health.api_available else "degraded"
+                )
+                _system_state["scanner_degraded_level"] = getattr(
+                    health.degraded_mode_level,
+                    "value",
+                    health.degraded_mode_level,
+                )
                 _system_state["scanner_uptime_pct"] = round(
                     health.uptime_percentage, 1
                 )
+                _system_state["scanner_consecutive_failures"] = int(
+                    getattr(
+                        health,
+                        "consecutive_failures",
+                        getattr(health, "consecutive_global_failures", 0),
+                    )
+                )
+                _system_state["scanner_last_poll"] = (
+                    health.last_successful_poll.isoformat()
+                    if health.last_successful_poll is not None
+                    else None
+                )
 
-            if self._absence_manager:
+                if self._market_data is not None:
+                    cache_stats = self._market_data.get_cache_stats_snapshot()
+                    _system_state["scanner_cache_entries"] = cache_stats.total_entries
+                    _system_state["scanner_cache_hit_rate"] = round(
+                        cache_stats.hit_rate, 4
+                    )
+            except Exception as exc:
+                _log.debug("dashboard_sync_scanner_error", error=str(exc))
+
+        if self._absence_manager:
+            try:
                 absence = self._absence_manager.compute_state()
                 _system_state["is_absent"] = absence.absence_level.value >= 1
                 _system_state["absence_level"] = absence.absence_level.value
-                _system_state["hours_since_activity"] = absence.hours_since_last_interaction
+                _system_state["hours_since_activity"] = (
+                    absence.hours_since_last_interaction
+                )
+            except Exception as exc:
+                _log.debug("dashboard_sync_absence_error", error=str(exc))
 
-            if self._cost_governor:
+        if self._cost_governor:
+            try:
                 budget = self._cost_governor.budget_tracker.state
                 _system_state["daily_spend_usd"] = round(budget.daily_spent_usd, 4)
-                _system_state["lifetime_spend_usd"] = round(budget.lifetime_spent_usd, 4)
+                _system_state["lifetime_spend_usd"] = round(
+                    budget.lifetime_spent_usd, 4
+                )
                 _system_state["opus_spend_today_usd"] = round(
                     getattr(budget, "daily_opus_spent_usd", 0.0), 4
                 )
@@ -1154,47 +2225,43 @@ class WorkflowOrchestrator:
                 _system_state["selectivity_ratio"] = round(
                     selectivity.cost_to_edge_ratio or 0.0, 4
                 )
+            except Exception as exc:
+                _log.debug("dashboard_sync_cost_error", error=str(exc))
 
-            if self._risk_governor:
+        if self._risk_governor:
+            try:
                 drawdown = self._risk_governor.drawdown_state
                 _system_state["drawdown_level"] = drawdown.level.value
-                _system_state["drawdown_pct"] = round(drawdown.current_drawdown_pct, 4)
-
-            # Equity snapshot for the chart (taken every sync cycle, ~5 min)
-            try:
-                from dashboard_api.app import _add_equity_snapshot
-                equity = _system_state.get(
-                    "paper_balance_usd", self._portfolio.current_equity_usd
+                _system_state["drawdown_pct"] = round(
+                    drawdown.current_drawdown_pct, 4
                 )
-                start_equity = _system_state.get(
-                    "start_of_day_equity_usd", self._portfolio.start_of_day_equity_usd
-                )
-                _add_equity_snapshot(
-                    equity_usd=round(float(equity), 2),
-                    pnl_usd=round(float(equity) - float(start_equity), 2),
-                )
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("dashboard_sync_risk_error", error=str(exc))
 
-            # Scanner cache/failure metrics (augment what the health block already set)
-            if self._scanner:
-                try:
-                    health = self._scanner.health_monitor.get_health_status()
-                    _system_state["scanner_cache_entries"] = getattr(
-                        health, "cache_entries_count", 0
-                    )
-                    _system_state["scanner_cache_hit_rate"] = getattr(
-                        health, "cache_hit_rate", 0.0
-                    )
-                    _system_state["scanner_consecutive_failures"] = getattr(
-                        health, "consecutive_failures", 0
-                    )
-                    _system_state["scanner_last_poll"] = datetime.now(tz=UTC).isoformat()
-                except Exception:
-                    pass
-
+        try:
+            _system_state["paper_equity_usd"] = round(
+                float(self._portfolio.current_equity_usd),
+                2,
+            )
         except Exception as exc:
-            _log.debug("dashboard_sync_error", error=str(exc))
+            _log.debug("dashboard_sync_equity_error", error=str(exc))
+
+        # Equity snapshot for the chart (taken every sync cycle, ~5 min)
+        try:
+            from dashboard_api.app import _add_equity_snapshot
+
+            equity = _system_state.get(
+                "paper_equity_usd", self._portfolio.current_equity_usd
+            )
+            start_equity = _system_state.get(
+                "start_of_day_equity_usd", self._portfolio.start_of_day_equity_usd
+            )
+            _add_equity_snapshot(
+                equity_usd=round(float(equity), 2),
+                pnl_usd=round(float(equity) - float(start_equity), 2),
+            )
+        except Exception as exc:
+            _log.debug("dashboard_sync_equity_snapshot_error", error=str(exc))
 
     # ================================================================
     # Notification helpers
@@ -1262,7 +2329,7 @@ class WorkflowOrchestrator:
                 "paper_mode": paper_mode,
                 "proposed_side": getattr(card, "proposed_side", None),
                 "category": getattr(card, "category", None),
-                "gross_edge": getattr(card, "expected_gross_edge", None),
+                "gross_edge": getattr(card, "gross_edge", None),
             },
         )
 

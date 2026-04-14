@@ -119,6 +119,8 @@ class ScannerHealthStatus(BaseModel):
     last_successful_poll: datetime | None = None
     consecutive_global_failures: int = 0
     total_polls: int = 0
+    successful_polls: int = 0
+    failed_polls: int = 0
     total_triggers_detected: int = 0
 
     # Degraded mode timing
@@ -131,6 +133,18 @@ class ScannerHealthStatus(BaseModel):
     position_reduction_active: bool = False
 
     last_updated: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+
+    @property
+    def uptime_percentage(self) -> float:
+        """Successful poll ratio expressed as a percentage."""
+        if self.total_polls <= 0:
+            return 100.0
+        return (self.successful_polls / self.total_polls) * 100.0
+
+    @property
+    def consecutive_failures(self) -> int:
+        """Backward-compatible alias for dashboard sync consumers."""
+        return self.consecutive_global_failures
 
 
 class ScannerHealthEvent(BaseModel):
@@ -158,9 +172,15 @@ class MarketWatchEntry(BaseModel):
 
     market_id: str
     token_id: str
+    title: str = ""
+    description: str | None = None
     is_held_position: bool = False
     position_id: str | None = None
     category: str | None = None
+    category_quality_tier: str = "standard"
+    resolution_source: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    end_date: datetime | None = None
     last_price: float | None = None
     last_spread: float | None = None
     last_depth_top3: float | None = None

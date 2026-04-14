@@ -147,7 +147,6 @@ class InvestigationOrchestrator:
         started_at = datetime.now(tz=UTC)
         models_used: set[str] = set()
         max_tier = "D"
-        total_cost = 0.0
 
         _log.info(
             "investigation_started",
@@ -212,11 +211,11 @@ class InvestigationOrchestrator:
                     cost_approval=cost_approval,
                     ask_levels=(ask_levels_by_market or {}).get(candidate.market_id, []),
                     models_used=models_used,
+                    agent_costs=result.agent_costs,
                 )
 
                 if thesis_card is not None:
                     result.thesis_cards.append(thesis_card)
-                    total_cost += thesis_card.expected_inference_cost_usd or 0.0
                 else:
                     result.no_trade_results.append(NoTradeResult(
                         market_id=candidate.market_id,
@@ -243,7 +242,7 @@ class InvestigationOrchestrator:
             result.outcome = InvestigationOutcome.CANDIDATE_ACCEPTED
             result.candidates_accepted = len(result.thesis_cards)
 
-        result.actual_cost_usd = total_cost
+        result.actual_cost_usd = round(sum(result.agent_costs.values()), 6)
         result.models_used = sorted(models_used)
         result.max_tier_used = max_tier
         result.completed_at = datetime.now(tz=UTC)
@@ -271,6 +270,7 @@ class InvestigationOrchestrator:
         cost_approval: CostApproval | None,
         ask_levels: list[OrderBookLevel],
         models_used: set[str],
+        agent_costs: dict[str, float],
     ) -> ThesisCardData | None:
         """Run the full investigation pipeline for a single candidate.
 
@@ -286,9 +286,10 @@ class InvestigationOrchestrator:
         )
 
         # --- Step 4: Assign domain manager ---
-        domain_memo = await self._run_domain_manager(
+        domain_memo, domain_role, domain_cost = await self._run_domain_manager(
             candidate, regime, workflow_run_id, models_used,
         )
+        agent_costs[domain_role] = agent_costs.get(domain_role, 0.0) + domain_cost
 
         if domain_memo is None or not domain_memo.recommended_proceed:
             _log.info(
@@ -308,6 +309,10 @@ class InvestigationOrchestrator:
             await self._run_optional_agents(
                 candidate, domain_memo, research, regime, workflow_run_id, models_used,
             )
+
+        # Merge all per-agent costs (pack + optional) into the run-level accumulator
+        for role, cost in research.per_agent_costs.items():
+            agent_costs[role] = agent_costs.get(role, 0.0) + cost
 
         # --- Step 7: Compute entry impact (Tier D) ---
         entry_impact = self._impact_calc.compute(
@@ -394,7 +399,7 @@ class InvestigationOrchestrator:
                 return None
 
         # --- Step 13: Adversarial synthesis (Opus, if qualified) ---
-        orchestrator_output = await self._run_orchestrator_synthesis(
+        orchestrator_output, synthesis_cost = await self._run_orchestrator_synthesis(
             candidate=candidate,
             domain_memo=domain_memo,
             research=research,
@@ -408,6 +413,7 @@ class InvestigationOrchestrator:
             workflow_run_id=workflow_run_id,
             models_used=models_used,
         )
+        agent_costs["investigator_orchestration"] = agent_costs.get("investigator_orchestration", 0.0) + synthesis_cost
 
         if orchestrator_output is None:
             return None
@@ -445,15 +451,18 @@ class InvestigationOrchestrator:
         regime: RegimeContext | None,
         workflow_run_id: str,
         models_used: set[str],
-    ) -> DomainMemo | None:
-        """Run the appropriate domain manager for the candidate's category."""
+    ) -> tuple[DomainMemo | None, str, float]:
+        """Run the appropriate domain manager for the candidate's category.
+
+        Returns (memo, role_name, cost_usd).
+        """
         manager_class = get_domain_manager_class(candidate.category)
         if manager_class is None:
             _log.warning(
                 "no_domain_manager_for_category",
                 category=candidate.category,
             )
-            return None
+            return None, "domain_manager_unknown", 0.0
 
         manager = manager_class(
             router=self._router,
@@ -469,10 +478,11 @@ class InvestigationOrchestrator:
 
         result = await manager.run(agent_input, regime=regime)
         models_used.add(self._router.model_for_tier(ModelTier.B))
+        cost = result.total_cost_usd if result.success else 0.0
 
         if result.success and result.result:
-            return DomainMemo(**result.result)
-        return None
+            return DomainMemo(**result.result), manager.role_name, cost
+        return None, manager.role_name, cost
 
     async def _run_research_pack(
         self,
@@ -514,6 +524,7 @@ class InvestigationOrchestrator:
                 for item in raw_items
             ]
             pack.total_research_cost_usd += evidence_result.total_cost_usd
+        pack.per_agent_costs["evidence_research"] = pack.per_agent_costs.get("evidence_research", 0.0) + evidence_result.total_cost_usd
         pack.agents_invoked.append("evidence_research")
 
         # Update context with evidence
@@ -537,6 +548,7 @@ class InvestigationOrchestrator:
         if counter_result.success:
             pack.counter_case = counter_result.result
             pack.total_research_cost_usd += counter_result.total_cost_usd
+        pack.per_agent_costs["counter_case"] = pack.per_agent_costs.get("counter_case", 0.0) + counter_result.total_cost_usd
         pack.agents_invoked.append("counter_case")
 
         # 3. Resolution Review Agent (Tier B)
@@ -555,6 +567,7 @@ class InvestigationOrchestrator:
         if resolution_result.success:
             pack.resolution_review = resolution_result.result
             pack.total_research_cost_usd += resolution_result.total_cost_usd
+        pack.per_agent_costs["resolution_review"] = pack.per_agent_costs.get("resolution_review", 0.0) + resolution_result.total_cost_usd
         pack.agents_invoked.append("resolution_review")
 
         # 4. Timing/Catalyst Agent (Tier C)
@@ -573,6 +586,7 @@ class InvestigationOrchestrator:
         if timing_result.success:
             pack.timing_assessment = timing_result.result
             pack.total_research_cost_usd += timing_result.total_cost_usd
+        pack.per_agent_costs["timing_catalyst"] = pack.per_agent_costs.get("timing_catalyst", 0.0) + timing_result.total_cost_usd
         pack.agents_invoked.append("timing_catalyst")
 
         # 5. Market Structure Agent (Tier D metrics + Tier C summary)
@@ -591,6 +605,7 @@ class InvestigationOrchestrator:
         if structure_result.success:
             pack.market_structure = structure_result.result
             pack.total_research_cost_usd += structure_result.total_cost_usd
+        pack.per_agent_costs["market_structure_summary"] = pack.per_agent_costs.get("market_structure_summary", 0.0) + structure_result.total_cost_usd
         pack.agents_invoked.append("market_structure_summary")
 
         _log.info(
@@ -639,6 +654,7 @@ class InvestigationOrchestrator:
             if result.success:
                 research.data_cross_check = result.result
                 research.total_research_cost_usd += result.total_cost_usd
+            research.per_agent_costs["data_cross_check"] = research.per_agent_costs.get("data_cross_check", 0.0) + result.total_cost_usd
             research.agents_invoked.append("data_cross_check")
 
         if "sentiment_drift" in justified:
@@ -655,6 +671,7 @@ class InvestigationOrchestrator:
             if result.success:
                 research.sentiment_drift = result.result
                 research.total_research_cost_usd += result.total_cost_usd
+            research.per_agent_costs["sentiment_drift"] = research.per_agent_costs.get("sentiment_drift", 0.0) + result.total_cost_usd
             research.agents_invoked.append("sentiment_drift")
 
         if "source_reliability" in justified:
@@ -671,6 +688,7 @@ class InvestigationOrchestrator:
             if result.success:
                 research.source_reliability = result.result
                 research.total_research_cost_usd += result.total_cost_usd
+            research.per_agent_costs["source_reliability"] = research.per_agent_costs.get("source_reliability", 0.0) + result.total_cost_usd
             research.agents_invoked.append("source_reliability")
 
     async def _run_orchestrator_synthesis(
@@ -688,11 +706,12 @@ class InvestigationOrchestrator:
         cost_approval: CostApproval | None,
         workflow_run_id: str,
         models_used: set[str],
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, float]:
         """Run the Investigator Orchestration Agent (Tier A or B fallback).
 
         Uses Opus only when all escalation conditions are met.
         Falls back to Tier B (Sonnet) when Opus is not justified.
+        Returns (output_dict, cost_usd).
         """
         # Determine tier: Opus if qualified, else Sonnet
         use_opus = False
@@ -758,9 +777,9 @@ class InvestigationOrchestrator:
                 market_id=candidate.market_id,
                 error=result.error,
             )
-            return None
+            return None, 0.0
 
-        return result.result
+        return result.result, result.total_cost_usd
 
     # --- Private helpers ---
 

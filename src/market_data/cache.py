@@ -153,35 +153,41 @@ class MarketDataCache:
     async def stats(self) -> CacheStats:
         """Return cache health statistics."""
         async with self._lock:
-            now = datetime.now(tz=UTC)
-            total_entries = sum(len(d) for d in self._store.values())
-            market_count = len(self._store)
+            return self._build_stats(datetime.now(tz=UTC))
 
-            oldest_age: float | None = None
-            newest_age: float | None = None
+    def snapshot_stats(self) -> CacheStats:
+        """Return a best-effort synchronous cache snapshot for dashboard sync."""
+        return self._build_stats(datetime.now(tz=UTC))
 
-            for snapshots in self._store.values():
-                if not snapshots:
-                    continue
-                oldest = (now - snapshots[0].polled_at).total_seconds()
-                newest = (now - snapshots[-1].polled_at).total_seconds()
-                if oldest_age is None or oldest > oldest_age:
-                    oldest_age = oldest
-                if newest_age is None or newest < newest_age:
-                    newest_age = newest
+    def _build_stats(self, now: datetime) -> CacheStats:
+        total_entries = sum(len(d) for d in self._store.values())
+        market_count = len(self._store)
 
-            total_requests = self._hits + self._misses
-            hit_rate = self._hits / total_requests if total_requests > 0 else 0.0
-            miss_rate = self._misses / total_requests if total_requests > 0 else 0.0
+        oldest_age: float | None = None
+        newest_age: float | None = None
 
-            return CacheStats(
-                market_count=market_count,
-                total_entries=total_entries,
-                hit_rate=hit_rate,
-                miss_rate=miss_rate,
-                oldest_entry_age_seconds=oldest_age,
-                newest_entry_age_seconds=newest_age,
-                avg_entries_per_market=(
-                    total_entries / market_count if market_count > 0 else 0.0
-                ),
-            )
+        for snapshots in self._store.values():
+            if not snapshots:
+                continue
+            oldest = (now - snapshots[0].polled_at).total_seconds()
+            newest = (now - snapshots[-1].polled_at).total_seconds()
+            if oldest_age is None or oldest > oldest_age:
+                oldest_age = oldest
+            if newest_age is None or newest < newest_age:
+                newest_age = newest
+
+        total_requests = self._hits + self._misses
+        hit_rate = self._hits / total_requests if total_requests > 0 else 0.0
+        miss_rate = self._misses / total_requests if total_requests > 0 else 0.0
+
+        return CacheStats(
+            market_count=market_count,
+            total_entries=total_entries,
+            hit_rate=hit_rate,
+            miss_rate=miss_rate,
+            oldest_entry_age_seconds=oldest_age,
+            newest_entry_age_seconds=newest_age,
+            avg_entries_per_market=(
+                total_entries / market_count if market_count > 0 else 0.0
+            ),
+        )

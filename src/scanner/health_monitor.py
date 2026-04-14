@@ -83,6 +83,8 @@ class ScannerHealthMonitor:
             last_successful_poll=dm.last_successful_poll,
             consecutive_global_failures=dm.consecutive_failures,
             total_polls=self._total_polls,
+            successful_polls=self._successful_polls,
+            failed_polls=self._failed_polls,
             total_triggers_detected=self._total_triggers,
             degraded_since=dm.degraded_since,
             degraded_duration_seconds=dm.degraded_duration_seconds,

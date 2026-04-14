@@ -19,6 +19,30 @@ from eligibility.types import CategoryClassification
 # These are the deterministic patterns applied to tags, slugs, titles, and
 # the raw category string from the Gamma API.
 
+# --- Title-first override patterns for Polymarket miscategorization ---
+# Applied BEFORE the API category check (Step 0). These patterns are high-confidence
+# signals that override a wrong raw_category from the Gamma API.
+
+_TITLE_GEOPOLITICS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r'\b(?:missile|airstrike|air\s+strike|drone\s+strike|naval\s+strike|military\s+action|ground\s+invasion|ceasefire|blockade)\b',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\b(?:iran|ukraine|russia|israel|gaza|hamas|hezbollah|nato|houthis?)\b.*\b(?:strike|attack|bomb|invade|weapon|military)\b',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\b(?:strike|attack|bomb|invade|weapon|military)\b.*\b(?:iran|ukraine|russia|israel|gaza|hamas|hezbollah|houthis?)\b',
+        re.IGNORECASE,
+    ),
+]
+
+_TITLE_SPORTS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r'\b(?:ipl|indian\s+premier\s+league)\b', re.IGNORECASE),
+    re.compile(r'\b(?:nba|nfl|mlb|nhl|ufc|mma)\s+(?:playoffs?|finals?|championship)\b', re.IGNORECASE),
+]
+
 _EXCLUDED_KEYWORDS: dict[str, ExcludedCategory] = {
     # News
     "news": ExcludedCategory.NEWS,
@@ -86,6 +110,18 @@ _ALLOWED_KEYWORDS: dict[str, Category] = {
     "foreign policy": Category.GEOPOLITICS,
     "tariff": Category.GEOPOLITICS,
     "trade war": Category.GEOPOLITICS,
+    "iran": Category.GEOPOLITICS,
+    "ukraine": Category.GEOPOLITICS,
+    "russia": Category.GEOPOLITICS,
+    "missile": Category.GEOPOLITICS,
+    "airstrike": Category.GEOPOLITICS,
+    "air strike": Category.GEOPOLITICS,
+    "military action": Category.GEOPOLITICS,
+    "naval": Category.GEOPOLITICS,
+    "ground forces": Category.GEOPOLITICS,
+    "ceasefire": Category.GEOPOLITICS,
+    "occupation": Category.GEOPOLITICS,
+    "blockade": Category.GEOPOLITICS,
     # Technology
     "technology": Category.TECHNOLOGY,
     "tech": Category.TECHNOLOGY,
@@ -150,6 +186,18 @@ _ALLOWED_KEYWORDS: dict[str, Category] = {
     "stanley cup": Category.SPORTS,
     "world series": Category.SPORTS,
     "olympics": Category.SPORTS,
+    "ipl": Category.SPORTS,
+    "indian premier": Category.SPORTS,
+    "la liga": Category.SPORTS,
+    "bundesliga": Category.SPORTS,
+    "serie a": Category.SPORTS,
+    "ligue 1": Category.SPORTS,
+    "mls": Category.SPORTS,
+    "pga": Category.SPORTS,
+    "grand slam": Category.SPORTS,
+    "wimbledon": Category.SPORTS,
+    "nascar": Category.SPORTS,
+    "indy": Category.SPORTS,
 }
 
 # Maps Gamma API category strings to our internal categories
@@ -198,6 +246,34 @@ def classify_category(
         CategoryClassification with the determined category, exclusion status,
         and quality tier.
     """
+
+    # --- Step 0: Title-first override (fires before API category) ---
+    # Catches Polymarket API miscategorization by checking high-confidence
+    # title signals before trusting the raw_category field.
+    if title:
+        norm_title_0 = title.strip().lower()
+        for pattern in _TITLE_GEOPOLITICS_PATTERNS:
+            if pattern.search(norm_title_0):
+                tier = CATEGORY_QUALITY_TIERS.get(Category.GEOPOLITICS.value, "standard")
+                return CategoryClassification(
+                    category=Category.GEOPOLITICS.value,
+                    is_excluded=False,
+                    quality_tier=tier,
+                    confidence=0.95,
+                    classification_method="title_override",
+                    raw_category=raw_category,
+                )
+        for pattern in _TITLE_SPORTS_PATTERNS:
+            if pattern.search(norm_title_0):
+                tier = CATEGORY_QUALITY_TIERS.get(Category.SPORTS.value, "standard")
+                return CategoryClassification(
+                    category=Category.SPORTS.value,
+                    is_excluded=False,
+                    quality_tier=tier,
+                    confidence=0.95,
+                    classification_method="title_override",
+                    raw_category=raw_category,
+                )
 
     # --- Step 1: Try raw API category ---
     if raw_category:
