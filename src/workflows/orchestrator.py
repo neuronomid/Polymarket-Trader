@@ -186,14 +186,17 @@ class WorkflowOrchestrator:
             raise
         session_factory = get_session_factory()
         _log.info("database_initialized")
+        self._log_activity("system", "Database", "Database initialized", severity="success")
 
         # 2. Market data service
         self._market_data = MarketDataService(self._config)
         await self._market_data.start()
+        self._log_activity("system", "Market Data", "Market data service started")
 
         # 3. Governors (deterministic, no dependencies)
         self._risk_governor = RiskGovernor(self._config.risk)
         self._cost_governor = CostGovernor(self._config.cost)
+        self._log_activity("system", "Governors", "Risk and Cost Governors initialized")
 
         # 4. Eligibility engine (deterministic)
         self._eligibility = EligibilityEngine(self._config.eligibility)
@@ -201,6 +204,7 @@ class WorkflowOrchestrator:
         # 5. LLM provider router
         self._provider_router = ProviderRouter.from_config(self._config)
         self._regime_adapter = RegimeAdapter()
+        self._log_activity("system", "LLM Framework", "Provider router and regime adapter ready")
 
         # 6. Investigation engine
         self._investigator = InvestigationOrchestrator(
@@ -223,6 +227,7 @@ class WorkflowOrchestrator:
         # 8. Scanner (depends on market data)
         self._scanner = TriggerScanner(self._config, self._market_data)
         self._scanner.set_trigger_callback(self._on_triggers)
+        self._log_activity("system", "Scanner", "Trigger scanner initialized")
 
         # 9. Calibration & learning subsystems
         self._calibration_store = CalibrationStore()
@@ -256,6 +261,7 @@ class WorkflowOrchestrator:
             policy_engine=policy_engine,
             no_trade_monitor=self._no_trade_monitor,
         )
+        self._log_activity("system", "Calibration", "Learning loops configured")
 
         # 10. Cross-cutting systems
         self._bias_detector = BiasDetector()
@@ -288,11 +294,26 @@ class WorkflowOrchestrator:
             from dashboard_api.app import set_session_factory, set_app_config, _system_state
             set_session_factory(session_factory)
             set_app_config(self._config)
-            _system_state["operator_mode"] = self._config.operator_mode
+            # Only set operator_mode from config if no persisted value exists.
+            # The dashboard API layer persists mode changes to disk, and we
+            # must not overwrite an operator-set mode on restart.
+            if "operator_mode" not in _system_state or _system_state["operator_mode"] is None:
+                _system_state["operator_mode"] = self._config.operator_mode
             _system_state["system_status"] = "initializing"
+            # Sync paper balance — only as default if not persisted
+            balance = getattr(self._config, 'paper_balance_usd', 500.0)
+            if _system_state.get("paper_balance_usd") is None:
+                _system_state["paper_balance_usd"] = balance
+            if _system_state.get("start_of_day_equity_usd") is None:
+                _system_state["start_of_day_equity_usd"] = balance
         except ImportError:
             _log.warning("dashboard_api_not_available")
 
+        self._log_activity(
+            "system", "Orchestrator",
+            f"System initialized in {self._config.operator_mode} mode with ${getattr(self._config, 'paper_balance_usd', 500.0):.2f}",
+            severity="success",
+        )
         _log.info("orchestrator_initialized", subsystems=12)
         self._state.phase = SystemPhase.STARTING
 
@@ -315,6 +336,7 @@ class WorkflowOrchestrator:
         # Start scanner
         await self._scanner.start()
         self._state.scanner_running = True
+        self._log_activity("system", "Scanner", "Trigger scanner started — polling CLOB API", severity="success")
 
         # Register periodic tasks
         self._register_periodic_tasks()
@@ -331,6 +353,13 @@ class WorkflowOrchestrator:
         await self._emit_system_health_event(
             "system_started",
             f"Polymarket Trader started in {self._config.operator_mode} mode",
+        )
+
+        self._log_activity(
+            "system", "Orchestrator",
+            f"System LIVE in {self._config.operator_mode.upper()} mode",
+            detail=f"{self._scheduler.task_count} scheduled tasks registered",
+            severity="success",
         )
 
         _log.info(
@@ -387,9 +416,21 @@ class WorkflowOrchestrator:
         self._state.total_scans += 1
         self._state.total_triggers += len(batch.triggers)
 
+        self._log_activity(
+            "scan", "Scanner",
+            f"Scan #{self._state.total_scans}: {len(batch.triggers)} triggers detected",
+            detail=f"Batch {batch.batch_id}",
+        )
+
         actionable = batch.actionable_triggers
         if not actionable:
             return
+
+        self._log_activity(
+            "trigger", "Scanner",
+            f"{len(actionable)} actionable triggers from batch",
+            severity="info",
+        )
 
         _log.info(
             "triggers_received",
@@ -401,18 +442,21 @@ class WorkflowOrchestrator:
         # Check absence restrictions
         if self._absence_manager and not self._absence_manager.can_enter_new_positions():
             _log.info("triggers_blocked_operator_absent")
+            self._log_activity("risk", "Absence Manager", "Triggers blocked: operator absent", severity="warning")
             return
 
         # Check risk governor: can we trade at all?
         can_trade, reason = self._risk_governor.can_trade(self._portfolio)
         if not can_trade:
             _log.info("triggers_blocked_risk_governor", reason=reason)
+            self._log_activity("risk", "Risk Governor", f"Triggers blocked: {reason}", severity="warning")
             return
 
         # Check cost governor
         can_start, reason = self._cost_governor.can_start_workflow()
         if not can_start:
             _log.info("triggers_blocked_cost_governor", reason=reason)
+            self._log_activity("cost", "Cost Governor", f"Triggers blocked: {reason}", severity="warning")
             return
 
         # Process Level C/D triggers through investigation pipeline
@@ -422,6 +466,10 @@ class WorkflowOrchestrator:
         ]
 
         if investigation_triggers:
+            self._log_activity(
+                "investigation", "Pipeline",
+                f"Processing {len(investigation_triggers)} C/D triggers through pipeline",
+            )
             async with self._pipeline_lock:
                 await self._run_trigger_pipeline(investigation_triggers, batch)
 
@@ -462,6 +510,10 @@ class WorkflowOrchestrator:
         # Run investigation
         try:
             self._state.total_investigations += 1
+            self._log_activity(
+                "investigation", "Investigator",
+                f"Investigation #{self._state.total_investigations} started with {len(candidates)} candidates",
+            )
             result = await self._investigator.run(
                 request,
                 regime=self._build_regime_context(),
@@ -472,6 +524,12 @@ class WorkflowOrchestrator:
                 self._state.total_no_trade_decisions += len(result.no_trade_results)
                 for nt in result.no_trade_results:
                     self._no_trade_monitor.record(accepted=False)
+                    self._log_activity(
+                        "trade", "Investigator",
+                        f"No-trade: {getattr(nt, 'reason', 'insufficient edge')}",
+                        detail=f"Market: {getattr(nt, 'market_id', '?')}",
+                        severity="info",
+                    )
 
                     # Emit no-trade notification
                     await self._emit_no_trade_event(nt)
@@ -479,10 +537,21 @@ class WorkflowOrchestrator:
             # Process accepted thesis cards through remaining pipeline
             for card in result.thesis_cards:
                 self._no_trade_monitor.record(accepted=True)
+                self._log_activity(
+                    "trade", "Investigator",
+                    f"Thesis card accepted: {getattr(card, 'title', '?')[:60]}",
+                    severity="success",
+                )
                 pipeline_result = await self._process_thesis_card(card)
 
                 if pipeline_result.accepted:
                     self._state.total_trades_entered += 1
+                    self._log_activity(
+                        "trade", "Execution",
+                        f"Trade #{self._state.total_trades_entered} entered (shadow)",
+                        detail=f"Market: {pipeline_result.market_id}",
+                        severity="success",
+                    )
 
         except Exception as exc:
             _log.error(
@@ -490,6 +559,7 @@ class WorkflowOrchestrator:
                 batch_id=batch.batch_id,
                 error=str(exc),
             )
+            self._log_activity("system", "Pipeline", f"Pipeline error: {str(exc)[:100]}", severity="error")
             self._state.recent_errors.append(
                 f"Pipeline error: {str(exc)[:200]}"
             )
@@ -898,11 +968,15 @@ class WorkflowOrchestrator:
             _log.error("shadow_forecast_error", error=str(exc))
 
     def _sync_dashboard_state(self) -> None:
-        """Push current system state to the dashboard API module."""
+        """Push current system state to the dashboard API module.
+
+        Note: operator_mode is NOT synced here — it is owned by the
+        dashboard API layer and persisted to disk independently.
+        Overwriting it would undo operator-initiated mode changes.
+        """
         try:
             from dashboard_api.app import _system_state
 
-            _system_state["operator_mode"] = self._config.operator_mode
             _system_state["system_status"] = self._state.phase.value
             _system_state["agents_running"] = self._state.phase == SystemPhase.RUNNING
 
@@ -1033,6 +1107,21 @@ class WorkflowOrchestrator:
     @property
     def event_bus(self) -> NotificationEventBus | None:
         return self._event_bus
+
+    def _log_activity(
+        self,
+        event_type: str,
+        component: str,
+        message: str,
+        detail: str | None = None,
+        severity: str = "info",
+    ) -> None:
+        """Push an activity log entry to the dashboard API shared state."""
+        try:
+            from dashboard_api.app import _add_activity
+            _add_activity(event_type, component, message, detail, severity)
+        except ImportError:
+            pass  # Dashboard API not available
 
     def record_operator_interaction(self, interaction_type: str = "login") -> None:
         """Record an operator interaction (from dashboard, API, etc.)."""

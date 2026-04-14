@@ -84,7 +84,7 @@ class DashboardService:
         row = result.one()
 
         return PortfolioOverview(
-            total_equity_usd=10000.0,  # Would come from account tracker
+            total_equity_usd=self._system_state.get("paper_balance_usd", 500.0),
             total_open_exposure_usd=float(row.exposure),
             daily_pnl_usd=float(row.unrealized) + float(row.realized),
             unrealized_pnl_usd=float(row.unrealized),
@@ -532,6 +532,10 @@ class DashboardService:
             new_mode=mode,
             reason=reason,
         )
+
+        # Persist to disk so it survives restarts
+        from dashboard_api.app import save_persisted_state
+        save_persisted_state()
 
         return SystemControlResponse(
             success=True,

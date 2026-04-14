@@ -1,13 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
+  ArrowDownCircle,
+  ArrowUpCircle,
   BarChart3,
   Bot,
   Brain,
-  ChevronRight,
+  ChevronDown,
   DollarSign,
   Eye,
   Gauge,
@@ -16,11 +18,13 @@ import {
   Play,
   Power,
   Radio,
+  RefreshCw,
   Shield,
   Square,
   Target,
   TrendingUp,
   UserX,
+  Wallet,
   Zap,
 } from "lucide-react";
 import {
@@ -38,7 +42,13 @@ import {
   fetchBias,
   fetchViability,
   fetchAbsence,
+  fetchPaperBalance,
+  fetchActivityLog,
+  depositPaperFunds,
+  withdrawPaperFunds,
   controlAgents,
+  changeMode,
+  isApiAvailable,
   type PortfolioOverview,
   type PositionSummary,
   type RiskBoard,
@@ -53,6 +63,8 @@ import {
   type BiasAuditOverview,
   type ViabilityOverview,
   type AbsenceStatus,
+  type PaperBalanceResponse,
+  type ActivityLogEntry,
 } from "@/lib/api";
 import { OverviewPage } from "@/components/pages/OverviewPage";
 import { PositionsPage } from "@/components/pages/PositionsPage";
@@ -73,7 +85,7 @@ type Page =
   | "agents"
   | "system";
 
-interface DashboardData {
+export interface DashboardData {
   portfolio: PortfolioOverview | null;
   positions: PositionSummary[];
   risk: RiskBoard | null;
@@ -88,6 +100,8 @@ interface DashboardData {
   bias: BiasAuditOverview | null;
   viability: ViabilityOverview | null;
   absence: AbsenceStatus | null;
+  paperBalance: PaperBalanceResponse | null;
+  activityLog: ActivityLogEntry[];
 }
 
 const NAV_ITEMS: { page: Page; label: string; icon: React.ReactNode; section: string }[] = [
@@ -101,28 +115,47 @@ const NAV_ITEMS: { page: Page; label: string; icon: React.ReactNode; section: st
   { page: "system", label: "System Health", icon: <HeartPulse />, section: "System" },
 ];
 
+const MODES = [
+  { value: "shadow", label: "Shadow", color: "var(--purple)", desc: "Simulated — no real trades" },
+  { value: "paper", label: "Paper", color: "var(--blue)", desc: "Paper trading mode" },
+  { value: "live_small", label: "Live Small", color: "var(--yellow)", desc: "Real trades, small size" },
+  { value: "live_standard", label: "Live", color: "var(--green)", desc: "Full live trading" },
+];
+
 export default function Dashboard() {
   const [page, setPage] = useState<Page>("overview");
   const [data, setData] = useState<DashboardData>({
     portfolio: null, positions: [], risk: null, cost: null, scanner: null,
     calibration: null, categories: [], workflows: [], triggers: [],
     agents: [], health: null, bias: null, viability: null, absence: null,
+    paperBalance: null, activityLog: [],
   });
-  const [agentsRunning, setAgentsRunning] = useState(true);
+  const [agentsRunning, setAgentsRunning] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
+  const [showModePanel, setShowModePanel] = useState(false);
+  const [showBalancePanel, setShowBalancePanel] = useState(false);
+  const [balanceInput, setBalanceInput] = useState("");
+  const [apiConnected, setApiConnected] = useState<boolean | null>(null);
+  const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadData = useCallback(async () => {
     try {
       const [portfolio, positions, risk, cost, scanner, calibration, categories,
-        workflows, triggers, agents, health, bias, viability, absence] = await Promise.all([
+        workflows, triggers, agents, health, bias, viability, absence,
+        paperBalance, activityLog] = await Promise.all([
         fetchPortfolio(), fetchPositions(), fetchRisk(), fetchCost(),
         fetchScanner(), fetchCalibration(), fetchCategories(),
         fetchWorkflows(), fetchTriggers(), fetchAgents(),
         fetchSystemHealth(), fetchBias(), fetchViability(), fetchAbsence(),
+        fetchPaperBalance(), fetchActivityLog(),
       ]);
       setData({ portfolio, positions, risk, cost, scanner, calibration, categories,
-        workflows, triggers, agents, health, bias, viability, absence });
-      setAgentsRunning(portfolio.system_status === "running");
+        workflows, triggers, agents, health, bias, viability, absence,
+        paperBalance, activityLog });
+      setAgentsRunning(portfolio?.system_status === "running");
+      setApiConnected(isApiAvailable());
+      setLastRefresh(new Date());
     } catch (err) {
       console.error("Failed to load dashboard data:", err);
     } finally {
@@ -130,7 +163,12 @@ export default function Dashboard() {
     }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  // Initial load + auto-refresh every 10s
+  useEffect(() => {
+    loadData();
+    refreshTimer.current = setInterval(loadData, 10000);
+    return () => { if (refreshTimer.current) clearInterval(refreshTimer.current); };
+  }, [loadData]);
 
   const handleToggleAgents = async () => {
     const action = agentsRunning ? "stop" : "start";
@@ -140,6 +178,42 @@ export default function Dashboard() {
       await loadData();
     }
   };
+
+  const handleChangeMode = async (mode: string) => {
+    const result = await changeMode(mode, `Dashboard mode switch to ${mode}`);
+    if (result.success) {
+      setShowModePanel(false);
+      await loadData();
+    }
+  };
+
+  const handleDeposit = async () => {
+    const amount = parseFloat(balanceInput);
+    if (!amount || amount <= 0) return;
+    try {
+      await depositPaperFunds(amount, "Dashboard deposit");
+      setBalanceInput("");
+      await loadData();
+    } catch (err) {
+      console.error("Deposit failed:", err);
+    }
+  };
+
+  const handleWithdraw = async () => {
+    const amount = parseFloat(balanceInput);
+    if (!amount || amount <= 0) return;
+    try {
+      await withdrawPaperFunds(amount, "Dashboard withdrawal");
+      setBalanceInput("");
+      await loadData();
+    } catch (err) {
+      console.error("Withdrawal failed:", err);
+    }
+  };
+
+  const currentMode = data.portfolio?.operator_mode || "shadow";
+  const modeInfo = MODES.find((m) => m.value === currentMode) || MODES[0];
+  const isShadowOrPaper = currentMode === "shadow" || currentMode === "paper";
 
   // Group nav items by section
   const sections = NAV_ITEMS.reduce<Record<string, typeof NAV_ITEMS>>((acc, item) => {
@@ -178,8 +252,145 @@ export default function Dashboard() {
           </div>
         ))}
 
-        {/* System Status at bottom */}
-        <div style={{ marginTop: "auto", padding: "1rem" }}>
+        {/* Mode Switcher */}
+        <div style={{ padding: "0.5rem 1rem", marginTop: "auto" }}>
+          <div className="card" style={{ padding: "0.75rem" }}>
+            {/* Current Mode Header */}
+            <button
+              onClick={() => setShowModePanel(!showModePanel)}
+              style={{
+                display: "flex", alignItems: "center", gap: "0.5rem", width: "100%",
+                background: "none", border: "none", cursor: "pointer", padding: "0.25rem 0",
+                color: "var(--text)", fontFamily: "inherit",
+              }}
+            >
+              <Radio size={14} color={modeInfo.color} />
+              <div style={{ flex: 1, textAlign: "left" }}>
+                <div style={{ fontSize: "0.7rem", fontWeight: 600, color: modeInfo.color, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                  {modeInfo.label} Mode
+                </div>
+                <div style={{ fontSize: "0.6rem", color: "var(--text-dim)" }}>{modeInfo.desc}</div>
+              </div>
+              <ChevronDown size={12} color="var(--text-muted)" style={{ transform: showModePanel ? "rotate(180deg)" : "none", transition: "transform 0.2s" }} />
+            </button>
+
+            {/* Mode Options — in-flow expansion (no absolute positioning) */}
+            {showModePanel && (
+              <div style={{
+                marginTop: "0.5rem", paddingTop: "0.5rem",
+                borderTop: "1px solid var(--border)",
+                display: "flex", flexDirection: "column", gap: "0.25rem",
+              }}>
+                {MODES.map((m) => (
+                  <button
+                    key={m.value}
+                    onClick={() => handleChangeMode(m.value)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: "0.5rem", width: "100%",
+                      padding: "0.5rem 0.5rem",
+                      background: currentMode === m.value ? "var(--neon-soft)" : "transparent",
+                      border: currentMode === m.value ? "1px solid var(--neon)" : "1px solid transparent",
+                      borderRadius: "var(--radius-sm)",
+                      cursor: "pointer", color: "var(--text)", fontFamily: "inherit",
+                      transition: "all 0.15s ease",
+                    }}
+                    onMouseEnter={(e) => {
+                      if (currentMode !== m.value) {
+                        e.currentTarget.style.background = "rgba(255,255,255,0.04)";
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      if (currentMode !== m.value) {
+                        e.currentTarget.style.background = "transparent";
+                      }
+                    }}
+                  >
+                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: m.color, flexShrink: 0 }} />
+                    <div style={{ textAlign: "left" }}>
+                      <div style={{ fontSize: "0.72rem", fontWeight: 600 }}>{m.label}</div>
+                      <div style={{ fontSize: "0.58rem", color: "var(--text-dim)" }}>{m.desc}</div>
+                    </div>
+                    {currentMode === m.value && (
+                      <span style={{ marginLeft: "auto", fontSize: "0.6rem", color: "var(--neon)", fontWeight: 600 }}>✓</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Paper Balance Panel (shadow/paper only) */}
+        {isShadowOrPaper && (
+          <div style={{ padding: "0 1rem 0.5rem" }}>
+            <div className="card" style={{ padding: "0.75rem" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
+                <Wallet size={14} color="var(--neon)" />
+                <span style={{ fontSize: "0.68rem", fontWeight: 600, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Paper Balance</span>
+              </div>
+              <div style={{ fontSize: "1.5rem", fontWeight: 700, color: "var(--neon)", fontFamily: "var(--font-display), 'Space Grotesk', sans-serif", letterSpacing: "-0.03em" }}>
+                ${(data.paperBalance?.balance_usd ?? data.portfolio?.total_equity_usd ?? 500).toFixed(2)}
+              </div>
+
+              {/* Always-visible deposit/withdraw controls */}
+              <div style={{ marginTop: "0.75rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                <input
+                  type="number"
+                  value={balanceInput}
+                  onChange={(e) => setBalanceInput(e.target.value)}
+                  placeholder="Enter amount (USD)"
+                  min="0"
+                  step="10"
+                  style={{
+                    width: "100%", padding: "0.55rem 0.65rem", fontSize: "0.8rem",
+                    background: "var(--bg-input, rgba(255,255,255,0.04))", border: "1px solid var(--border)",
+                    borderRadius: "var(--radius-sm)", color: "var(--text)",
+                    fontFamily: "inherit", outline: "none",
+                  }}
+                  onFocus={(e) => { e.currentTarget.style.borderColor = "var(--neon)"; }}
+                  onBlur={(e) => { e.currentTarget.style.borderColor = "var(--border)"; }}
+                />
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
+                  <button
+                    onClick={handleDeposit}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "center", gap: "0.4rem",
+                      width: "100%", padding: "0.55rem 0", fontSize: "0.78rem", fontWeight: 600,
+                      background: "rgba(1, 121, 111, 0.15)", color: "var(--neon)",
+                      border: "1px solid var(--neon)", borderRadius: "var(--radius-sm)",
+                      cursor: "pointer", fontFamily: "inherit",
+                      transition: "all 0.15s ease",
+                      boxSizing: "border-box", minWidth: 0,
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(1, 121, 111, 0.30)"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(1, 121, 111, 0.15)"; }}
+                  >
+                    <ArrowDownCircle size={15} /> Deposit
+                  </button>
+                  <button
+                    onClick={handleWithdraw}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "center", gap: "0.4rem",
+                      width: "100%", padding: "0.55rem 0", fontSize: "0.78rem", fontWeight: 600,
+                      background: "rgba(244, 63, 94, 0.12)", color: "var(--red, #f43f5e)",
+                      border: "1px solid var(--red, #f43f5e)", borderRadius: "var(--radius-sm)",
+                      cursor: "pointer", fontFamily: "inherit",
+                      transition: "all 0.15s ease",
+                      boxSizing: "border-box", minWidth: 0,
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(244, 63, 94, 0.25)"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(244, 63, 94, 0.12)"; }}
+                  >
+                    <ArrowUpCircle size={15} /> Withdraw
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* System Status */}
+        <div style={{ padding: "0 1rem 1rem" }}>
           <div className="card" style={{ padding: "0.75rem" }}>
             <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
               <span className={`status-dot ${agentsRunning ? "live" : "stopped"}`} />
@@ -197,7 +408,7 @@ export default function Dashboard() {
                 <Play size={12} /> Start
               </button>
               <button
-                className={`btn-neon danger ${!agentsRunning ? "" : ""}`}
+                className="btn-neon danger"
                 style={{ flex: 1, fontSize: "0.65rem", padding: "0.35rem 0.5rem", justifyContent: "center" }}
                 onClick={handleToggleAgents}
                 disabled={!agentsRunning}
@@ -222,10 +433,10 @@ export default function Dashboard() {
               </span>
             </div>
             <div className="topbar-item">
-              <Radio size={12} />
+              <Radio size={12} color={modeInfo.color} />
               <span className="label">Mode</span>
-              <span className="value" style={{ color: "var(--blue)", textTransform: "uppercase" }}>
-                {data.portfolio?.operator_mode || "—"}
+              <span className="value" style={{ color: modeInfo.color, textTransform: "uppercase" }}>
+                {modeInfo.label}
               </span>
             </div>
             <div className="topbar-item">
@@ -237,9 +448,9 @@ export default function Dashboard() {
             </div>
             <div className="topbar-item">
               <DollarSign size={12} />
-              <span className="label">Daily P&L</span>
-              <span className="value" style={{ color: (data.portfolio?.daily_pnl_usd || 0) >= 0 ? "var(--green)" : "var(--red)" }}>
-                {(data.portfolio?.daily_pnl_usd || 0) >= 0 ? "+" : ""}${data.portfolio?.daily_pnl_usd.toFixed(2) || "0.00"}
+              <span className="label">Balance</span>
+              <span className="value" style={{ color: "var(--neon)" }}>
+                ${(data.paperBalance?.balance_usd ?? data.portfolio?.total_equity_usd ?? 0).toFixed(2)}
               </span>
             </div>
             <div className="topbar-item">
@@ -249,9 +460,32 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="topbar-controls">
-            <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>
-              {new Date().toLocaleTimeString()}
-            </span>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              {/* API Status Indicator */}
+              <span style={{
+                display: "inline-flex", alignItems: "center", gap: "0.3rem",
+                fontSize: "0.6rem", color: apiConnected ? "var(--green)" : "var(--text-muted)",
+                padding: "0.2rem 0.5rem", border: "1px solid var(--border)",
+                borderRadius: "var(--radius-sm)", background: apiConnected ? "rgba(var(--green-rgb), 0.08)" : "transparent",
+              }}>
+                <span style={{ width: 5, height: 5, borderRadius: "50%", background: apiConnected ? "var(--green)" : "var(--text-muted)", display: "inline-block" }} />
+                {apiConnected ? "LIVE" : "MOCK"}
+              </span>
+              {/* Auto-refresh indicator */}
+              <button
+                onClick={loadData}
+                style={{
+                  display: "inline-flex", alignItems: "center", gap: "0.3rem",
+                  fontSize: "0.6rem", color: "var(--text-dim)", background: "none",
+                  border: "1px solid var(--border)", borderRadius: "var(--radius-sm)",
+                  padding: "0.2rem 0.5rem", cursor: "pointer", fontFamily: "inherit",
+                }}
+                title="Refresh now"
+              >
+                <RefreshCw size={10} />
+                {lastRefresh.toLocaleTimeString()}
+              </button>
+            </div>
           </div>
         </header>
 
@@ -261,7 +495,7 @@ export default function Dashboard() {
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "60vh" }}>
               <div style={{ textAlign: "center" }}>
                 <div className="status-dot live" style={{ width: 16, height: 16, margin: "0 auto 1rem" }} />
-                <div style={{ color: "var(--text-dim)", fontSize: "0.8rem" }}>Loading dashboard data…</div>
+                <div style={{ color: "var(--text-dim)", fontSize: "0.8rem" }}>Connecting to system…</div>
               </div>
             </div>
           ) : (

@@ -143,4 +143,4 @@ def test_default_yaml_file_loads():
     path = Path("config/default.yaml")
     if path.exists():
         config = load_config(path)
-        assert config.operator_mode == "paper"
+        assert config.operator_mode in ("paper", "shadow")

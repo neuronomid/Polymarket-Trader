@@ -2,7 +2,7 @@
 # Override via environment variables with POLYMARKET_ prefix.
 # Example: POLYMARKET_DATABASE__HOST=myhost
 
-operator_mode: paper
+operator_mode: shadow
 log_level: INFO
 paper_balance_usd: 500.0
 

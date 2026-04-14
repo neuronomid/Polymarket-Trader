@@ -392,3 +392,42 @@ class SystemControlResponse(BaseModel):
     message: str
     current_mode: str
     timestamp: datetime
+
+
+# ──────────────────────────────────────────────
+# Paper Balance
+# ──────────────────────────────────────────────
+
+
+class PaperBalanceResponse(BaseModel):
+    """Current paper/shadow mode balance."""
+
+    balance_usd: float = 500.0
+    start_of_day_equity_usd: float = 500.0
+    operator_mode: str = "shadow"
+    transactions: list[dict] = Field(default_factory=list)
+
+
+class PaperBalanceRequest(BaseModel):
+    """Request to deposit or withdraw paper funds."""
+
+    amount_usd: float
+    reason: str | None = None
+
+
+# ──────────────────────────────────────────────
+# Activity Log
+# ──────────────────────────────────────────────
+
+
+class ActivityLogEntry(BaseModel):
+    """A single system activity log entry."""
+
+    id: str
+    timestamp: datetime
+    event_type: str  # scan, trigger, investigation, trade, risk, cost, system
+    component: str
+    message: str
+    detail: str | None = None
+    severity: str = "info"  # info, warning, error, success
+

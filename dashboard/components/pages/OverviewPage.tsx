@@ -1,38 +1,18 @@
 "use client";
 
+import { useState, useMemo } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  BarChart, Bar, PieChart, Pie, Cell,
+  BarChart, Bar, Cell,
 } from "recharts";
 import {
-  TrendingUp, TrendingDown, DollarSign, Target, Shield, Activity,
+  TrendingUp, DollarSign, Target, Shield, Activity,
   Zap, Eye, ArrowUpRight, ArrowDownRight,
+  Radio, AlertTriangle, CheckCircle, XCircle, Info,
 } from "lucide-react";
-import type {
-  PortfolioOverview, PositionSummary, RiskBoard, CostMetrics,
-  ScannerHealth, CalibrationOverview, CategoryPerformanceEntry,
-  WorkflowRunSummary, TriggerEventItem, AgentStatus,
-  SystemHealthOverview, BiasAuditOverview, ViabilityOverview, AbsenceStatus,
-} from "@/lib/api";
+import type { DashboardData } from "@/app/page";
 
-interface DashboardData {
-  portfolio: PortfolioOverview | null;
-  positions: PositionSummary[];
-  risk: RiskBoard | null;
-  cost: CostMetrics | null;
-  scanner: ScannerHealth | null;
-  calibration: CalibrationOverview | null;
-  categories: CategoryPerformanceEntry[];
-  workflows: WorkflowRunSummary[];
-  triggers: TriggerEventItem[];
-  agents: AgentStatus[];
-  health: SystemHealthOverview | null;
-  bias: BiasAuditOverview | null;
-  viability: ViabilityOverview | null;
-  absence: AbsenceStatus | null;
-}
-
-const CHART_COLORS = ["#39FF14", "#00D4FF", "#9B5DE5", "#FFBE0B", "#FF6B35", "#FF3B5C"];
+const CHART_COLORS = ["#01796f", "#0ea5e9", "#8b5cf6", "#f59e0b", "#f97316", "#f43f5e"];
 
 const CustomTooltip = ({ active, payload, label }: any) => {
   if (!active || !payload?.length) return null;
@@ -54,24 +34,69 @@ const CustomTooltip = ({ active, payload, label }: any) => {
   );
 };
 
+const SEVERITY_ICONS: Record<string, React.ReactNode> = {
+  success: <CheckCircle size={12} color="var(--green)" />,
+  warning: <AlertTriangle size={12} color="var(--yellow)" />,
+  error: <XCircle size={12} color="var(--red)" />,
+  info: <Info size={12} color="var(--blue)" />,
+};
+
+const SEVERITY_COLORS: Record<string, string> = {
+  success: "var(--green)",
+  warning: "var(--yellow)",
+  error: "var(--red)",
+  info: "var(--blue)",
+};
+
+const EVENT_BADGE_COLOR: Record<string, string> = {
+  system: "purple",
+  scan: "blue",
+  trigger: "yellow",
+  investigation: "blue",
+  trade: "green",
+  risk: "red",
+  cost: "yellow",
+};
+
+function timeAgo(timestamp: string): string {
+  const diff = Date.now() - new Date(timestamp).getTime();
+  const seconds = Math.floor(diff / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 export function OverviewPage({ data }: { data: DashboardData }) {
   const p = data.portfolio;
+  const [timeframe, setTimeframe] = useState<"D" | "W" | "M" | "All">("D");
+
+  const equityData = useMemo(() => {
+    if (!p) return [];
+    return p.equity_history.map((e) => ({
+      date: e.timestamp,
+      equity: e.equity_usd,
+    }));
+  }, [p]);
+
+  const filteredEquityData = useMemo(() => {
+    if (!equityData.length) return [];
+    if (timeframe === "All") return equityData;
+    
+    // Assume chronological, so end is latest
+    const now = new Date(equityData[equityData.length - 1].date).getTime();
+    
+    const cutoff =
+      timeframe === "D" ? now - 24 * 60 * 60 * 1000 :
+      timeframe === "W" ? now - 7 * 24 * 60 * 60 * 1000 :
+      now - 30 * 24 * 60 * 60 * 1000; // "M"
+      
+    return equityData.filter(d => new Date(d.date).getTime() >= cutoff);
+  }, [equityData, timeframe]);
+
   if (!p) return null;
-
-  const equityData = p.equity_history.map((e) => ({
-    date: e.timestamp,
-    equity: e.equity_usd,
-  }));
-
-  const exposureData = data.risk?.exposure_by_category.map((e) => ({
-    name: e.category,
-    value: e.exposure_usd,
-  })) || [];
-
-  const triggerLevels = data.triggers.reduce<Record<string, number>>((acc, t) => {
-    acc[t.trigger_level] = (acc[t.trigger_level] || 0) + 1;
-    return acc;
-  }, {});
 
   return (
     <div>
@@ -92,7 +117,9 @@ export function OverviewPage({ data }: { data: DashboardData }) {
           <div className="stat-value glow-green" style={{ color: "var(--neon)" }}>
             ${p.total_equity_usd.toLocaleString(undefined, { minimumFractionDigits: 2 })}
           </div>
-          <div className="stat-label">Account balance</div>
+          <div className="stat-label">
+            {p.operator_mode === "shadow" || p.operator_mode === "paper" ? "Paper balance" : "Account balance"}
+          </div>
         </div>
 
         <div className="card fade-in stagger-2">
@@ -151,49 +178,112 @@ export function OverviewPage({ data }: { data: DashboardData }) {
           </div>
         </div>
 
-        <div className="card fade-in stagger-6">
-          <div className="card-header">
-            <span className="card-title">Selectivity</span>
-            <Eye size={14} color="var(--yellow)" />
-          </div>
-          <div className="stat-value" style={{ color: (data.cost?.selectivity_ratio || 0) < (data.cost?.selectivity_target || 0.2) ? "var(--green)" : "var(--yellow)" }}>
-            {((data.cost?.selectivity_ratio || 0) * 100).toFixed(1)}%
-          </div>
-          <div className="stat-label">Target: {((data.cost?.selectivity_target || 0.2) * 100).toFixed(0)}%</div>
-        </div>
       </div>
 
       {/* Charts Grid */}
-      <div className="content-grid" style={{ marginTop: "1rem" }}>
-        {/* Equity Curve */}
+      {filteredEquityData.length > 0 && (
+        <div className="content-grid" style={{ marginTop: "1rem" }}>
+          <div className="card fade-in" style={{ gridColumn: "span 2" }}>
+            <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                <span className="card-title">Equity Curve</span>
+                <TrendingUp size={14} color="var(--neon)" />
+              </div>
+              <div style={{ display: "flex", gap: "0.25rem" }}>
+                {("D W M All".split(" ") as ("D" | "W" | "M" | "All")[]).map((tf) => (
+                  <button
+                    key={tf}
+                    onClick={() => setTimeframe(tf)}
+                    style={{
+                      background: tf === timeframe ? "var(--neon-soft)" : "transparent",
+                      border: tf === timeframe ? "1px solid var(--neon)" : "1px solid var(--border)",
+                      color: tf === timeframe ? "var(--neon)" : "var(--text-dim)",
+                      padding: "0.15rem 0.5rem",
+                      fontSize: "0.65rem",
+                      borderRadius: "var(--radius-sm)",
+                      cursor: "pointer",
+                      boxSizing: "border-box",
+                    }}
+                  >
+                    {tf}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div style={{ height: 220 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={filteredEquityData}>
+                  <defs>
+                    <linearGradient id="equityGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#01796f" stopOpacity={0.3} />
+                      <stop offset="100%" stopColor="#01796f" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <XAxis dataKey="date" tick={false} stroke="transparent" />
+                  <YAxis
+                    domain={["dataMin - 20", "dataMax + 20"]}
+                    tick={{ fill: "var(--text-dim)", fontSize: 11 }}
+                    stroke="transparent"
+                    tickFormatter={(v) => `$${v.toLocaleString()}`}
+                  />
+                  <Tooltip content={<CustomTooltip />} />
+                  <Area
+                    type="monotone" dataKey="equity" stroke="#01796f"
+                    fill="url(#equityGrad)" strokeWidth={2}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="content-grid">
+        {/* Activity Feed */}
         <div className="card fade-in" style={{ gridColumn: "span 2" }}>
           <div className="card-header">
-            <span className="card-title">Equity Curve — 30 Days</span>
-            <TrendingUp size={14} color="var(--neon)" />
+            <span className="card-title">Live Activity Feed</span>
+            <Activity size={14} color="var(--neon)" />
           </div>
-          <div style={{ height: 250 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={equityData}>
-                <defs>
-                  <linearGradient id="equityGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#39FF14" stopOpacity={0.3} />
-                    <stop offset="100%" stopColor="#39FF14" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <XAxis dataKey="date" tick={false} stroke="transparent" />
-                <YAxis
-                  domain={["dataMin - 100", "dataMax + 100"]}
-                  tick={{ fill: "var(--text-dim)", fontSize: 11 }}
-                  stroke="transparent"
-                  tickFormatter={(v) => `$${v.toLocaleString()}`}
-                />
-                <Tooltip content={<CustomTooltip />} />
-                <Area
-                  type="monotone" dataKey="equity" stroke="#39FF14"
-                  fill="url(#equityGrad)" strokeWidth={2}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+          <div style={{ maxHeight: 380, overflowY: "auto" }}>
+            {data.activityLog.length === 0 ? (
+              <div style={{ padding: "2rem", textAlign: "center", color: "var(--text-dim)" }}>
+                <Radio size={20} style={{ marginBottom: "0.5rem", opacity: 0.5 }} />
+                <div style={{ fontSize: "0.8rem" }}>Waiting for system activity…</div>
+                <div style={{ fontSize: "0.65rem", color: "var(--text-muted)", marginTop: "0.25rem" }}>
+                  Activity will appear here when the backend is running
+                </div>
+              </div>
+            ) : (
+              data.activityLog.map((entry) => (
+                <div key={entry.id} style={{
+                  display: "flex", alignItems: "flex-start", gap: "0.6rem",
+                  padding: "0.5rem 0", borderBottom: "1px solid rgba(255,255,255,0.03)",
+                }}>
+                  <div style={{ paddingTop: "0.15rem" }}>
+                    {SEVERITY_ICONS[entry.severity] || SEVERITY_ICONS.info}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+                      <span className={`badge ${EVENT_BADGE_COLOR[entry.event_type] || "muted"}`} style={{ fontSize: "0.55rem", padding: "0.12rem 0.4rem" }}>
+                        {entry.component}
+                      </span>
+                      <span style={{ fontSize: "0.6rem", color: "var(--text-muted)" }}>
+                        {timeAgo(entry.timestamp)}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: "0.75rem", fontWeight: 500, marginTop: "0.15rem", color: SEVERITY_COLORS[entry.severity] || "var(--text)" }}>
+                      {entry.message}
+                    </div>
+                    {entry.detail && (
+                      <div style={{ fontSize: "0.65rem", color: "var(--text-dim)", marginTop: "0.1rem" }}>
+                        {entry.detail}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>
@@ -206,21 +296,27 @@ export function OverviewPage({ data }: { data: DashboardData }) {
             <Target size={14} color="var(--blue)" />
           </div>
           <div style={{ maxHeight: 280, overflowY: "auto" }}>
-            <table className="data-table">
-              <thead><tr><th>Market</th><th>Side</th><th>P&L</th><th>Status</th></tr></thead>
-              <tbody>
-                {data.positions.slice(0, 5).map((pos) => (
-                  <tr key={pos.id}>
-                    <td style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{pos.market_title}</td>
-                    <td><span className={`badge ${pos.side === "yes" ? "green" : "red"}`}>{pos.side}</span></td>
-                    <td style={{ color: (pos.unrealized_pnl || 0) >= 0 ? "var(--green)" : "var(--red)" }}>
-                      {(pos.unrealized_pnl || 0) >= 0 ? "+" : ""}${(pos.unrealized_pnl || 0).toFixed(2)}
-                    </td>
-                    <td><span className={`badge ${pos.review_tier === "new" ? "blue" : pos.review_tier === "stable" ? "green" : "muted"}`}>{pos.review_tier}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            {data.positions.length === 0 ? (
+              <div style={{ padding: "1.5rem", textAlign: "center", color: "var(--text-dim)", fontSize: "0.75rem" }}>
+                No open positions yet
+              </div>
+            ) : (
+              <table className="data-table">
+                <thead><tr><th>Market</th><th>Side</th><th>P&L</th><th>Status</th></tr></thead>
+                <tbody>
+                  {data.positions.slice(0, 5).map((pos) => (
+                    <tr key={pos.id}>
+                      <td style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{pos.market_title}</td>
+                      <td><span className={`badge ${pos.side === "yes" ? "green" : "red"}`}>{pos.side}</span></td>
+                      <td style={{ color: (pos.unrealized_pnl || 0) >= 0 ? "var(--green)" : "var(--red)" }}>
+                        {(pos.unrealized_pnl || 0) >= 0 ? "+" : ""}${(pos.unrealized_pnl || 0).toFixed(2)}
+                      </td>
+                      <td><span className={`badge ${pos.review_tier === "new" ? "blue" : pos.review_tier === "stable" ? "green" : "muted"}`}>{pos.review_tier}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         </div>
 
@@ -231,25 +327,31 @@ export function OverviewPage({ data }: { data: DashboardData }) {
             <Zap size={14} color="var(--yellow)" />
           </div>
           <div style={{ maxHeight: 280, overflowY: "auto" }}>
-            {data.triggers.slice(0, 5).map((t) => (
-              <div key={t.id} style={{
-                display: "flex", alignItems: "center", gap: "0.75rem",
-                padding: "0.5rem 0", borderBottom: "1px solid var(--border)",
-              }}>
-                <span className={`badge ${t.trigger_level === "C" || t.trigger_level === "D" ? "red" : t.trigger_level === "B" ? "yellow" : "muted"}`}>
-                  {t.trigger_level}
-                </span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: "0.75rem", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {t.market_title || t.market_id}
-                  </div>
-                  <div style={{ fontSize: "0.65rem", color: "var(--text-dim)" }}>{t.reason}</div>
-                </div>
-                <span className={`badge ${t.trigger_class === "profit_protection" ? "green" : t.trigger_class === "discovery" ? "blue" : "muted"}`} style={{ fontSize: "0.6rem" }}>
-                  {t.trigger_class.replace(/_/g, " ")}
-                </span>
+            {data.triggers.length === 0 ? (
+              <div style={{ padding: "1.5rem", textAlign: "center", color: "var(--text-dim)", fontSize: "0.75rem" }}>
+                No triggers yet — scanner will report here
               </div>
-            ))}
+            ) : (
+              data.triggers.slice(0, 5).map((t) => (
+                <div key={t.id} style={{
+                  display: "flex", alignItems: "center", gap: "0.75rem",
+                  padding: "0.5rem 0", borderBottom: "1px solid var(--border)",
+                }}>
+                  <span className={`badge ${t.trigger_level === "C" || t.trigger_level === "D" ? "red" : t.trigger_level === "B" ? "yellow" : "muted"}`}>
+                    {t.trigger_level}
+                  </span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: "0.75rem", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {t.market_title || t.market_id}
+                    </div>
+                    <div style={{ fontSize: "0.65rem", color: "var(--text-dim)" }}>{t.reason}</div>
+                  </div>
+                  <span className={`badge ${t.trigger_class === "profit_protection" ? "green" : t.trigger_class === "discovery" ? "blue" : "muted"}`} style={{ fontSize: "0.6rem" }}>
+                    {t.trigger_class.replace(/_/g, " ")}
+                  </span>
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>
@@ -262,18 +364,24 @@ export function OverviewPage({ data }: { data: DashboardData }) {
             <Shield size={14} color="var(--blue)" />
           </div>
           <div style={{ height: 220 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={data.risk?.exposure_by_category || []} layout="vertical">
-                <XAxis type="number" tick={{ fill: "var(--text-dim)", fontSize: 10 }} stroke="transparent" tickFormatter={(v) => `$${v}`} />
-                <YAxis type="category" dataKey="category" tick={{ fill: "var(--text-dim)", fontSize: 11 }} stroke="transparent" width={80} />
-                <Tooltip content={<CustomTooltip />} />
-                <Bar dataKey="exposure_usd" fill="#39FF14" radius={[0, 4, 4, 0]} barSize={16}>
-                  {(data.risk?.exposure_by_category || []).map((_, i) => (
-                    <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} fillOpacity={0.8} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+            {(data.risk?.exposure_by_category?.length || 0) > 0 ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={data.risk?.exposure_by_category || []} layout="vertical">
+                  <XAxis type="number" tick={{ fill: "var(--text-dim)", fontSize: 10 }} stroke="transparent" tickFormatter={(v) => `$${v}`} />
+                  <YAxis type="category" dataKey="category" tick={{ fill: "var(--text-dim)", fontSize: 11 }} stroke="transparent" width={80} />
+                  <Tooltip content={<CustomTooltip />} />
+                  <Bar dataKey="exposure_usd" fill="#01796f" radius={[0, 4, 4, 0]} barSize={16}>
+                    {(data.risk?.exposure_by_category || []).map((_, i) => (
+                      <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} fillOpacity={0.8} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-dim)", fontSize: "0.75rem" }}>
+                No exposure yet — positions will appear after trades
+              </div>
+            )}
           </div>
         </div>
 
@@ -284,28 +392,34 @@ export function OverviewPage({ data }: { data: DashboardData }) {
             <Zap size={14} color="var(--purple)" />
           </div>
           <div style={{ maxHeight: 220, overflowY: "auto" }}>
-            {data.workflows.slice(0, 5).map((wf) => (
-              <div key={wf.id} style={{
-                display: "flex", alignItems: "center", gap: "0.75rem",
-                padding: "0.5rem 0", borderBottom: "1px solid var(--border)",
-              }}>
-                <span className={`badge ${wf.status === "completed" ? "green" : wf.status === "running" ? "blue" : "red"}`}>
-                  {wf.status === "running" ? "●" : "✓"} {wf.status}
-                </span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: "0.75rem", fontWeight: 500 }}>
-                    {wf.workflow_type.replace(/_/g, " ")}
-                  </div>
-                  <div style={{ fontSize: "0.65rem", color: "var(--text-dim)" }}>
-                    {wf.candidates_reviewed > 0 && `${wf.candidates_reviewed} reviewed → ${wf.candidates_accepted} accepted`}
-                    {wf.candidates_reviewed === 0 && wf.market_title}
-                  </div>
-                </div>
-                <div style={{ fontSize: "0.7rem", color: wf.cost_usd > 0 ? "var(--purple)" : "var(--text-dim)" }}>
-                  ${wf.cost_usd.toFixed(2)}
-                </div>
+            {data.workflows.length === 0 ? (
+              <div style={{ padding: "1.5rem", textAlign: "center", color: "var(--text-dim)", fontSize: "0.75rem" }}>
+                No workflow runs yet
               </div>
-            ))}
+            ) : (
+              data.workflows.slice(0, 5).map((wf) => (
+                <div key={wf.id} style={{
+                  display: "flex", alignItems: "center", gap: "0.75rem",
+                  padding: "0.5rem 0", borderBottom: "1px solid var(--border)",
+                }}>
+                  <span className={`badge ${wf.status === "completed" ? "green" : wf.status === "running" ? "blue" : "red"}`}>
+                    {wf.status === "running" ? "●" : "✓"} {wf.status}
+                  </span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: "0.75rem", fontWeight: 500 }}>
+                      {wf.workflow_type.replace(/_/g, " ")}
+                    </div>
+                    <div style={{ fontSize: "0.65rem", color: "var(--text-dim)" }}>
+                      {wf.candidates_reviewed > 0 && `${wf.candidates_reviewed} reviewed → ${wf.candidates_accepted} accepted`}
+                      {wf.candidates_reviewed === 0 && wf.market_title}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: "0.7rem", color: wf.cost_usd > 0 ? "var(--purple)" : "var(--text-dim)" }}>
+                    ${wf.cost_usd.toFixed(2)}
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>

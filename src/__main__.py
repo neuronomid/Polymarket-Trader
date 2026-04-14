@@ -76,6 +76,14 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
+    # Inject shutdown event into the dashboard API so the Stop button works
+    try:
+        from dashboard_api.app import set_shutdown_event
+        set_shutdown_event(shutdown_event)
+        log.info("shutdown_event_wired_to_dashboard")
+    except ImportError:
+        log.debug("dashboard_api_not_available_for_shutdown")
+
     try:
         await orchestrator.initialize()
         log.info("orchestrator_initialized")

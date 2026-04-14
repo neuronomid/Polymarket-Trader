@@ -6,9 +6,12 @@ the Next.js frontend running on localhost:3000.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -18,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dashboard_api.schemas import (
     AbsenceStatus,
+    ActivityLogEntry,
     AgentStatus,
     AlertItem,
     BiasAuditOverview,
@@ -25,6 +29,8 @@ from dashboard_api.schemas import (
     CategoryPerformanceEntry,
     CostMetrics,
     OperatorModeRequest,
+    PaperBalanceRequest,
+    PaperBalanceResponse,
     PortfolioOverview,
     PositionDetail,
     PositionSummary,
@@ -41,11 +47,47 @@ from dashboard_api.services import DashboardService
 _log = structlog.get_logger(component="dashboard_api")
 
 # ──────────────────────────────────────────────
+# Persisted state — survives restarts
+# ──────────────────────────────────────────────
+
+_STATE_FILE = Path("data") / "system_state.json"
+
+# Keys that are persisted to disk so they survive restarts
+_PERSISTED_KEYS = ("operator_mode", "paper_balance_usd", "start_of_day_equity_usd")
+
+
+def _load_persisted_state() -> dict[str, Any]:
+    """Load persisted state values from the JSON state file."""
+    try:
+        if _STATE_FILE.exists():
+            with open(_STATE_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_persisted_state() -> None:
+    """Write the persisted subset of _system_state to disk."""
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {k: _system_state[k] for k in _PERSISTED_KEYS if k in _system_state}
+        with open(_STATE_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+    except OSError as exc:
+        _log.warning("state_persist_failed", error=str(exc))
+
+
+# ──────────────────────────────────────────────
 # Shared system state — mutable singleton
 # ──────────────────────────────────────────────
 
+_persisted = _load_persisted_state()
+
 _system_state: dict[str, Any] = {
-    "operator_mode": "paper",
+    "operator_mode": _persisted.get("operator_mode", "shadow"),
     "system_status": "running",
     "agents_running": False,
     "drawdown_level": "normal",
@@ -67,6 +109,12 @@ _system_state: dict[str, Any] = {
     "hours_since_activity": 0.0,
     "viability_signal": "unassessed",
     "active_alerts_count": 0,
+    # Paper balance tracking
+    "paper_balance_usd": _persisted.get("paper_balance_usd", 500.0),
+    "start_of_day_equity_usd": _persisted.get("start_of_day_equity_usd", 500.0),
+    "paper_transactions": [],
+    # Activity log (circular buffer, last 200 events)
+    "activity_log": [],
 }
 
 
@@ -77,6 +125,10 @@ _system_state: dict[str, Any] = {
 # Session factory — injected at startup
 _session_factory = None
 _app_config = None
+
+# Shutdown event — injected by the orchestrator / __main__
+# When set, the system performs a graceful shutdown.
+_shutdown_event: asyncio.Event | None = None
 
 
 def set_session_factory(factory: Any) -> None:
@@ -89,6 +141,12 @@ def set_app_config(config: Any) -> None:
     """Set the application config for dependency injection."""
     global _app_config
     _app_config = config
+
+
+def set_shutdown_event(event: asyncio.Event) -> None:
+    """Inject the shutdown event so the dashboard can trigger system shutdown."""
+    global _shutdown_event
+    _shutdown_event = event
 
 
 async def get_db_session():
@@ -385,7 +443,171 @@ def create_dashboard_app() -> FastAPI:
     async def stop_agents(
         service: DashboardService = Depends(get_dashboard_service),
     ):
-        """Stop all agents."""
-        return await service.toggle_agents(running=False)
+        """Stop all agents and trigger system shutdown."""
+        result = await service.toggle_agents(running=False)
+        _add_activity("system", "Operator", "System shutdown requested from dashboard", severity="warning")
+        # Trigger graceful system shutdown
+        if _shutdown_event is not None:
+            _log.info("dashboard_shutdown_requested")
+            _shutdown_event.set()
+        else:
+            _log.warning("shutdown_event_not_wired", message="No shutdown event — system state toggled only")
+        return result
+
+    @app.post(
+        "/api/control/shutdown",
+        response_model=SystemControlResponse,
+        tags=["operator"],
+    )
+    async def shutdown_system(
+        service: DashboardService = Depends(get_dashboard_service),
+    ):
+        """Initiate a graceful system shutdown."""
+        _add_activity("system", "Operator", "Graceful shutdown initiated from dashboard", severity="warning")
+        await service.toggle_agents(running=False)
+        if _shutdown_event is not None:
+            _log.info("dashboard_shutdown_requested")
+            _shutdown_event.set()
+            return SystemControlResponse(
+                success=True,
+                message="Shutdown initiated — system is shutting down",
+                current_mode=_system_state.get("operator_mode", "shadow"),
+                timestamp=datetime.now(tz=UTC),
+            )
+        return SystemControlResponse(
+            success=False,
+            message="Shutdown event not wired — cannot shut down from dashboard",
+            current_mode=_system_state.get("operator_mode", "shadow"),
+            timestamp=datetime.now(tz=UTC),
+        )
+
+    # ─── Paper Balance ────────────────────────────
+
+    @app.get(
+        "/api/paper-balance",
+        response_model=PaperBalanceResponse,
+        tags=["operator"],
+    )
+    async def get_paper_balance():
+        """Get current paper balance."""
+        return PaperBalanceResponse(
+            balance_usd=_system_state.get("paper_balance_usd", 500.0),
+            start_of_day_equity_usd=_system_state.get("start_of_day_equity_usd", 500.0),
+            operator_mode=_system_state.get("operator_mode", "shadow"),
+            transactions=_system_state.get("paper_transactions", [])[-20:],
+        )
+
+    @app.post(
+        "/api/paper-balance/deposit",
+        response_model=PaperBalanceResponse,
+        tags=["operator"],
+    )
+    async def deposit_paper_funds(request: PaperBalanceRequest):
+        """Deposit paper funds."""
+        if request.amount_usd <= 0:
+            raise HTTPException(status_code=400, detail="Amount must be positive")
+        mode = _system_state.get("operator_mode", "shadow")
+        if mode not in ("shadow", "paper"):
+            raise HTTPException(status_code=400, detail="Can only deposit in shadow/paper mode")
+
+        _system_state["paper_balance_usd"] = _system_state.get("paper_balance_usd", 500.0) + request.amount_usd
+        txn = {
+            "type": "deposit",
+            "amount_usd": request.amount_usd,
+            "reason": request.reason or "Manual deposit",
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "balance_after": _system_state["paper_balance_usd"],
+        }
+        _system_state.setdefault("paper_transactions", []).append(txn)
+        _add_activity("system", "Paper Balance", f"Deposited ${request.amount_usd:.2f}", severity="success")
+        _log.info("paper_deposit", amount=request.amount_usd, new_balance=_system_state["paper_balance_usd"])
+        save_persisted_state()
+
+        return PaperBalanceResponse(
+            balance_usd=_system_state["paper_balance_usd"],
+            start_of_day_equity_usd=_system_state.get("start_of_day_equity_usd", 500.0),
+            operator_mode=mode,
+            transactions=_system_state.get("paper_transactions", [])[-20:],
+        )
+
+    @app.post(
+        "/api/paper-balance/withdraw",
+        response_model=PaperBalanceResponse,
+        tags=["operator"],
+    )
+    async def withdraw_paper_funds(request: PaperBalanceRequest):
+        """Withdraw paper funds."""
+        if request.amount_usd <= 0:
+            raise HTTPException(status_code=400, detail="Amount must be positive")
+        mode = _system_state.get("operator_mode", "shadow")
+        if mode not in ("shadow", "paper"):
+            raise HTTPException(status_code=400, detail="Can only withdraw in shadow/paper mode")
+
+        current = _system_state.get("paper_balance_usd", 500.0)
+        if request.amount_usd > current:
+            raise HTTPException(status_code=400, detail=f"Insufficient balance: ${current:.2f}")
+
+        _system_state["paper_balance_usd"] = current - request.amount_usd
+        txn = {
+            "type": "withdraw",
+            "amount_usd": request.amount_usd,
+            "reason": request.reason or "Manual withdrawal",
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "balance_after": _system_state["paper_balance_usd"],
+        }
+        _system_state.setdefault("paper_transactions", []).append(txn)
+        _add_activity("system", "Paper Balance", f"Withdrew ${request.amount_usd:.2f}", severity="warning")
+        _log.info("paper_withdraw", amount=request.amount_usd, new_balance=_system_state["paper_balance_usd"])
+        save_persisted_state()
+
+        return PaperBalanceResponse(
+            balance_usd=_system_state["paper_balance_usd"],
+            start_of_day_equity_usd=_system_state.get("start_of_day_equity_usd", 500.0),
+            operator_mode=mode,
+            transactions=_system_state.get("paper_transactions", [])[-20:],
+        )
+
+    # ─── Activity Log ─────────────────────────────
+
+    @app.get(
+        "/api/activity",
+        response_model=list[ActivityLogEntry],
+        tags=["system"],
+    )
+    async def get_activity_log(
+        limit: int = Query(50, ge=1, le=200),
+    ):
+        """Get recent system activity log."""
+        log_entries = _system_state.get("activity_log", [])
+        return [ActivityLogEntry(**e) for e in log_entries[-limit:][::-1]]
 
     return app
+
+
+# ──────────────────────────────────────────────
+# Activity Log Helper
+# ──────────────────────────────────────────────
+
+def _add_activity(
+    event_type: str,
+    component: str,
+    message: str,
+    detail: str | None = None,
+    severity: str = "info",
+) -> None:
+    """Add an entry to the in-memory activity log."""
+    import uuid as _uuid
+    entry = {
+        "id": str(_uuid.uuid4()),
+        "timestamp": datetime.now(tz=UTC).isoformat(),
+        "event_type": event_type,
+        "component": component,
+        "message": message,
+        "detail": detail,
+        "severity": severity,
+    }
+    log = _system_state.setdefault("activity_log", [])
+    log.append(entry)
+    # Keep only last 200 entries
+    if len(log) > 200:
+        _system_state["activity_log"] = log[-200:]
