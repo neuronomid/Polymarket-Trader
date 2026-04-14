@@ -489,10 +489,10 @@ class WorkflowOrchestrator:
                 category=getattr(trigger, "category", "unknown"),
                 trigger_class=trigger.trigger_class,
                 trigger_level=trigger.trigger_level,
-                price=trigger.current_price,
-                mid_price=trigger.current_price,
-                spread=trigger.current_spread,
-                visible_depth_usd=trigger.current_depth_top3 or 0.0,
+                price=trigger.price or 0.5,
+                mid_price=trigger.price or 0.5,
+                spread=trigger.spread or 0.0,
+                visible_depth_usd=(trigger.depth_snapshot or {}).get("top3_usd", 0.0),
             )
             candidates.append(candidate)
 
@@ -704,10 +704,11 @@ class WorkflowOrchestrator:
                 result = self._eligibility.evaluate(elig_input)
 
                 if result.outcome == EligibilityOutcome.INVESTIGATE_NOW.value:
+                    token_id = market.token_ids[0] if market.token_ids else ""
                     eligible_candidates.append(
                         CandidateContext(
                             market_id=elig_input.market_id,
-                            token_id=market.token_ids[0] if market.token_ids else "",
+                            token_id=token_id,
                             title=elig_input.title,
                             category=result.category_classification.category or "unknown",
                             trigger_class="discovery",
@@ -718,6 +719,17 @@ class WorkflowOrchestrator:
                             visible_depth_usd=elig_input.liquidity_usd,
                         )
                     )
+                    # Register eligible markets with the scanner watch list so
+                    # trigger-based monitoring picks up subsequent price moves.
+                    if token_id:
+                        self._scanner.add_to_watch_list(
+                            MarketWatchEntry(
+                                market_id=elig_input.market_id,
+                                token_id=token_id,
+                                category=result.category_classification.category or "unknown",
+                                last_spread=elig_input.spread,
+                            )
+                        )
 
             _log.info(
                 "sweep_eligibility_complete",
@@ -982,7 +994,7 @@ class WorkflowOrchestrator:
 
             if self._scanner:
                 health = self._scanner.health_monitor.get_health_status()
-                _system_state["scanner_api_status"] = "healthy" if health.is_healthy else "degraded"
+                _system_state["scanner_api_status"] = "healthy" if health.api_available else "degraded"
                 _system_state["scanner_degraded_level"] = health.degraded_mode_level.value
                 _system_state["scanner_uptime_pct"] = round(
                     health.uptime_percentage, 1
