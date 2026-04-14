@@ -1,10 +1,15 @@
 """Database engine and session management.
 
 Provides async SQLAlchemy engine and session factory for all database access.
+Supports both PostgreSQL (production) and SQLite (paper mode / development).
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -17,28 +22,71 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def _remap_jsonb_for_sqlite() -> None:
+    """Remap PostgreSQL JSONB columns to generic JSON for SQLite compatibility."""
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy import JSON
+
+    from data.base import Base
+
+    for table in Base.metadata.tables.values():
+        for column in table.columns:
+            if isinstance(column.type, JSONB):
+                column.type = JSON()
+
+
 async def init_db(database_url: str, echo: bool = False) -> AsyncEngine:
     """Initialize the async database engine and session factory.
 
     Args:
-        database_url: PostgreSQL async connection string
-            (e.g. postgresql+asyncpg://user:pass@host:port/db).
+        database_url: Async connection string. Supported formats:
+            - postgresql+asyncpg://user:pass@host:port/db
+            - sqlite+aiosqlite:///path/to/db.sqlite (paper mode)
         echo: If True, log all SQL statements.
     """
     global _engine, _session_factory
 
-    _engine = create_async_engine(
-        database_url,
-        echo=echo,
-        pool_size=10,
-        max_overflow=20,
-        pool_pre_ping=True,
-    )
+    is_sqlite = "sqlite" in database_url
+
+    engine_kwargs: dict = {
+        "echo": echo,
+    }
+
+    if is_sqlite:
+        # SQLite doesn't support connection pooling the same way
+        engine_kwargs["connect_args"] = {"check_same_thread": False}
+        # Remap JSONB → JSON for SQLite
+        _remap_jsonb_for_sqlite()
+    else:
+        engine_kwargs["pool_size"] = 10
+        engine_kwargs["max_overflow"] = 20
+        engine_kwargs["pool_pre_ping"] = True
+
+    _engine = create_async_engine(database_url, **engine_kwargs)
+
+    # Enable foreign keys for SQLite
+    if is_sqlite:
+        @event.listens_for(_engine.sync_engine, "connect")
+        def _enable_sqlite_fks(dbapi_conn, _):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
     _session_factory = async_sessionmaker(
         bind=_engine,
         class_=AsyncSession,
         expire_on_commit=False,
     )
+
+    # Auto-create tables for SQLite (no Alembic needed for paper mode)
+    if is_sqlite:
+        # Import all models so Base.metadata is populated
+        import data.models  # noqa: F401
+
+        async with _engine.begin() as conn:
+            from data.base import Base
+            await conn.run_sync(Base.metadata.create_all)
+
     return _engine
 
 

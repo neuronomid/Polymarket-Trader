@@ -53,6 +53,11 @@ from data.models.resolution import (  # noqa: F401
     SportsQualityGateResult,
 )
 from data.models.risk import RiskSnapshot, RuleDecision  # noqa: F401
+from data.models.scanner import (  # noqa: F401
+    CLOBCacheEntry,
+    ScannerDataSnapshot,
+    ScannerHealthEvent,
+)
 from data.models.thesis import NetEdgeEstimate, ThesisCard  # noqa: F401
 from data.models.viability import (  # noqa: F401
     LifetimeBudgetStatus,

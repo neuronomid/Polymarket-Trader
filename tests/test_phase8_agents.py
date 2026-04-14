@@ -290,12 +290,33 @@ class TestProviderAbstraction:
         from config.settings import ModelConfig
 
         config = ModelConfig(
-            anthropic_api_key="test-key",
+            openrouter_api_key="test-openrouter-key",
             openai_api_key="test-key-2",
             tier_a_model="claude-opus-4-6",
         )
         router = ProviderRouter.from_config(config)
         assert router.model_for_tier(ModelTier.A) == "claude-opus-4-6"
+        assert router._openrouter._api_key == "test-openrouter-key"
+        assert router._openai._api_key == "test-key-2"
+
+    def test_provider_router_legacy_anthropic_key_falls_back_to_openrouter(
+        self, tmp_path, monkeypatch
+    ):
+        from config import settings as settings_module
+        from agents.providers import ProviderRouter
+        from config.settings import ModelConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("POLYMARKET_MODELS__OPENROUTER_API_KEY", raising=False)
+        settings_module._load_dotenv_values.cache_clear()
+        try:
+            config = ModelConfig(anthropic_api_key="legacy-anthropic-key")
+            router = ProviderRouter.from_config(config)
+        finally:
+            settings_module._load_dotenv_values.cache_clear()
+
+        assert router._openrouter._api_key == "legacy-anthropic-key"
 
     def test_provider_router_custom_models(self):
         from agents.providers import ProviderRouter
@@ -308,6 +329,15 @@ class TestProviderAbstraction:
         assert router.model_for_tier(ModelTier.A) == "custom-opus"
         assert router.model_for_tier(ModelTier.B) == "custom-sonnet"
         assert router.model_for_tier(ModelTier.C) == "custom-nano"
+
+    def test_openrouter_provider_maps_internal_model_aliases(self):
+        from agents.providers import OpenRouterProvider
+
+        assert OpenRouterProvider._resolve_model("claude-opus-4-6") == "anthropic/claude-opus-4.6"
+        assert (
+            OpenRouterProvider._resolve_model("claude-sonnet-4-6")
+            == "anthropic/claude-sonnet-4.6"
+        )
 
 
 # =============================================================================

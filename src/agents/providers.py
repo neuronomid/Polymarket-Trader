@@ -1,6 +1,7 @@
 """LLM Provider Abstraction Layer.
 
-Unified interface over Anthropic (Opus/Sonnet) and OpenAI (GPT-5.4 nano/mini).
+Unified interface over OpenRouter (for Anthropic-family tiers A/B)
+and OpenAI (GPT-5.4 nano/mini for tier C).
 Every call is tracked with: model, provider, input/output tokens, estimated cost,
 cost class, and latency. Automatic cost class annotation (H/M/L/Z).
 
@@ -31,6 +32,12 @@ _PRICING_PER_1M_TOKENS: dict[str, dict[str, float]] = {
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
     "gpt-5.4-nano": {"input": 0.10, "output": 0.40},
     "gpt-5.4-mini": {"input": 0.40, "output": 1.60},
+}
+
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_OPENROUTER_MODEL_ALIASES: dict[str, str] = {
+    "claude-opus-4-6": "anthropic/claude-opus-4.6",
+    "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
 }
 
 
@@ -196,28 +203,38 @@ class BaseLLMProvider:
         raise NotImplementedError
 
 
-class AnthropicProvider(BaseLLMProvider):
-    """Anthropic API provider (Claude Opus 4.6, Claude Sonnet 4.6).
+class OpenRouterProvider(BaseLLMProvider):
+    """OpenRouter provider for Anthropic-family tiers A/B.
 
-    Tier A (Premium) and Tier B (Workhorse).
+    Uses OpenRouter's OpenAI-compatible API surface with the user's
+    OpenRouter API key.
     """
 
-    provider_name = "anthropic"
+    provider_name = "openrouter"
 
-    def __init__(self, api_key: str = "") -> None:
+    def __init__(self, api_key: str = "", *, base_url: str = _OPENROUTER_BASE_URL) -> None:
         super().__init__(api_key)
         self._client = None
+        self._base_url = base_url
+
+    @staticmethod
+    def _resolve_model(model: str) -> str:
+        """Map internal Anthropic-family aliases to OpenRouter model IDs."""
+        return _OPENROUTER_MODEL_ALIASES.get(model, model)
 
     def _ensure_client(self) -> Any:
-        """Lazily initialize the Anthropic async client."""
+        """Lazily initialize the OpenRouter client."""
         if self._client is None:
             try:
-                import anthropic
+                import openai
 
-                self._client = anthropic.AsyncAnthropic(api_key=self._api_key)
+                self._client = openai.AsyncOpenAI(
+                    api_key=self._api_key,
+                    base_url=self._base_url,
+                )
             except ImportError:
                 raise RuntimeError(
-                    "anthropic package not installed. Install with: pip install anthropic"
+                    "openai package not installed. Install with: pip install openai"
                 )
         return self._client
 
@@ -230,22 +247,30 @@ class AnthropicProvider(BaseLLMProvider):
         temperature: float,
     ) -> LLMResponse:
         client = self._ensure_client()
-        response = await client.messages.create(
-            model=model,
+        response = await client.chat.completions.create(
+            model=self._resolve_model(model),
             max_tokens=max_tokens,
             temperature=temperature,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
 
         content = ""
-        if response.content:
-            content = response.content[0].text
+        usage_input = 0
+        usage_output = 0
+
+        if response.choices:
+            content = response.choices[0].message.content or ""
+        if response.usage:
+            usage_input = response.usage.prompt_tokens
+            usage_output = response.usage.completion_tokens
 
         return LLMResponse(
             content=content,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
+            input_tokens=usage_input,
+            output_tokens=usage_output,
             model=model,
             provider=self.provider_name,
             raw_response=response,
@@ -334,15 +359,20 @@ class ProviderRouter:
 
     def __init__(
         self,
-        anthropic_api_key: str = "",
+        openrouter_api_key: str = "",
         openai_api_key: str = "",
         *,
+        anthropic_api_key: str = "",
+        openrouter_base_url: str = _OPENROUTER_BASE_URL,
         tier_a_model: str = "",
         tier_b_model: str = "",
         tier_c_model: str = "",
         tier_c_alt_model: str = "",
     ) -> None:
-        self._anthropic = AnthropicProvider(api_key=anthropic_api_key)
+        self._openrouter = OpenRouterProvider(
+            api_key=openrouter_api_key or anthropic_api_key,
+            base_url=openrouter_base_url,
+        )
         self._openai = OpenAIProvider(api_key=openai_api_key)
 
         # Allow model overrides; fall back to constants
@@ -358,7 +388,7 @@ class ProviderRouter:
     def _provider_for_tier(self, tier: ModelTier) -> BaseLLMProvider:
         """Select provider based on tier."""
         if tier in (ModelTier.A, ModelTier.B):
-            return self._anthropic
+            return self._openrouter
         elif tier == ModelTier.C:
             return self._openai
         else:
@@ -441,10 +471,16 @@ class ProviderRouter:
         # Support both AppConfig (config.models.*) and ModelConfig directly
         models = getattr(config, "models", config)
         return cls(
-            anthropic_api_key=getattr(models, "anthropic_api_key", ""),
+            openrouter_api_key=getattr(models, "openrouter_api_key", "")
+            or getattr(models, "anthropic_api_key", ""),
             openai_api_key=getattr(models, "openai_api_key", ""),
+            openrouter_base_url=getattr(models, "openrouter_base_url", _OPENROUTER_BASE_URL),
             tier_a_model=getattr(models, "tier_a_model", ""),
             tier_b_model=getattr(models, "tier_b_model", ""),
             tier_c_model=getattr(models, "tier_c_model", ""),
             tier_c_alt_model=getattr(models, "tier_c_alt_model", ""),
         )
+
+
+# Backward-compatible alias: Anthropic-family tiers now route through OpenRouter.
+AnthropicProvider = OpenRouterProvider

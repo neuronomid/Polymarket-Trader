@@ -5,7 +5,8 @@ from pathlib import Path
 
 import yaml
 
-from config.settings import AppConfig, load_config
+from config import settings as settings_module
+from config.settings import AppConfig, ModelConfig, load_config
 
 
 def test_default_config_loads():
@@ -14,6 +15,48 @@ def test_default_config_loads():
     assert config.operator_mode == "paper"
     assert config.log_level == "INFO"
     assert config.database.name == "polymarket_trader"
+
+
+def test_model_config_reads_standard_api_keys_from_dotenv(tmp_path, monkeypatch):
+    """Model config should honor standard .env keys without prefixed exports."""
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=openai-dotenv-key\n"
+        "OPENROUTER_API_KEY=openrouter-dotenv-key\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("POLYMARKET_MODELS__OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("POLYMARKET_MODELS__OPENROUTER_API_KEY", raising=False)
+
+    settings_module._load_dotenv_values.cache_clear()
+    try:
+        config = ModelConfig()
+    finally:
+        settings_module._load_dotenv_values.cache_clear()
+
+    assert config.openai_api_key == "openai-dotenv-key"
+    assert config.openrouter_api_key == "openrouter-dotenv-key"
+
+
+def test_model_config_prefers_environment_over_dotenv(tmp_path, monkeypatch):
+    """Process env vars should override .env values when both are present."""
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=openai-dotenv-key\n"
+        "OPENROUTER_API_KEY=openrouter-dotenv-key\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-env-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-env-key")
+
+    settings_module._load_dotenv_values.cache_clear()
+    try:
+        config = ModelConfig()
+    finally:
+        settings_module._load_dotenv_values.cache_clear()
+
+    assert config.openai_api_key == "openai-env-key"
+    assert config.openrouter_api_key == "openrouter-env-key"
 
 
 def test_load_config_from_yaml():

@@ -1,12 +1,20 @@
 """Entry point for `python -m polymarket_trader`.
 
-Loads configuration, sets up logging, and reports system readiness.
-Actual workflow scheduling will be added in later phases.
+Loads configuration, sets up logging, initializes all subsystems via the
+WorkflowOrchestrator, and starts the full pipeline including:
+  - Scanner polling loop
+  - Scheduled investigation sweeps
+  - Position review scheduler
+  - Calibration learning loops (fast + slow)
+  - Absence monitoring
+  - Dashboard API
+  - Notification service
 """
 
 from __future__ import annotations
 
 import asyncio
+import signal
 import sys
 from pathlib import Path
 
@@ -52,14 +60,71 @@ async def main() -> None:
         cost_lifetime_budget=config.cost.lifetime_experiment_budget_usd,
     )
 
-    # Placeholder: workflow scheduler will be wired here in Phase 5+
-    log.info("awaiting_shutdown", message="No workflows configured yet. Press Ctrl+C to exit.")
-    try:
-        await asyncio.Event().wait()
-    except asyncio.CancelledError:
-        pass
+    # --- Initialize and start the orchestrator ---
+    from workflows.orchestrator import WorkflowOrchestrator
 
-    log.info("shutdown_complete")
+    orchestrator = WorkflowOrchestrator(config)
+
+    # Set up graceful shutdown
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _signal_handler():
+        log.info("shutdown_signal_received")
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _signal_handler)
+
+    try:
+        await orchestrator.initialize()
+        log.info("orchestrator_initialized")
+
+        await orchestrator.start()
+        log.info(
+            "orchestrator_running",
+            mode=mode.value,
+            message="System is live. Press Ctrl+C to shut down.",
+        )
+
+        # Optionally start the dashboard API in a background task
+        dashboard_task = asyncio.create_task(_start_dashboard_api(config, log))
+
+        # Wait for shutdown signal
+        await shutdown_event.wait()
+
+    except Exception as exc:
+        log.error("startup_error", error=str(exc))
+        raise
+    finally:
+        log.info("shutting_down")
+        await orchestrator.shutdown()
+        log.info("shutdown_complete")
+
+
+async def _start_dashboard_api(config, log) -> None:
+    """Start the FastAPI dashboard API server in the background."""
+    try:
+        import uvicorn
+        from dashboard_api.app import create_dashboard_app
+
+        app = create_dashboard_app()
+
+        uv_config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=8000,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(uv_config)
+
+        log.info("dashboard_api_starting", port=8000)
+        await server.serve()
+    except ImportError:
+        log.warning("uvicorn_not_installed", message="Dashboard API not started. Install uvicorn.")
+    except Exception as exc:
+        log.error("dashboard_api_error", error=str(exc))
 
 
 if __name__ == "__main__":

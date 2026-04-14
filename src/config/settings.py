@@ -5,6 +5,8 @@ Config hierarchy: defaults → YAML file → environment variables (highest prio
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,50 @@ def _load_yaml_config(path: Path | None) -> dict[str, Any]:
     with open(resolved) as f:
         data = yaml.safe_load(f)
     return data if isinstance(data, dict) else {}
+
+
+@lru_cache(maxsize=1)
+def _load_dotenv_values() -> dict[str, str]:
+    """Load key/value pairs from the nearest .env file without exporting them."""
+    for base in (Path.cwd(), *Path.cwd().parents):
+        dotenv_path = base / ".env"
+        if not dotenv_path.exists():
+            continue
+
+        values: dict[str, str] = {}
+        with open(dotenv_path) as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                if value and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+
+                values[key] = value
+
+        return values
+
+    return {}
+
+
+def _load_env_value(*names: str) -> str:
+    """Resolve a config value from env vars first, then the local .env file."""
+    dotenv_values = _load_dotenv_values()
+    for name in names:
+        env_value = os.getenv(name)
+        if env_value is not None:
+            return env_value
+
+        dotenv_value = dotenv_values.get(name)
+        if dotenv_value is not None:
+            return dotenv_value
+
+    return ""
 
 
 class DatabaseConfig(BaseSettings):
@@ -124,10 +170,37 @@ class EligibilityConfig(BaseSettings):
 
 
 class ModelConfig(BaseSettings):
-    """LLM provider API keys and model overrides."""
+    """LLM API keys and model overrides.
 
-    anthropic_api_key: str = ""
-    openai_api_key: str = ""
+    Tier A/B Anthropic-family models route through OpenRouter by default.
+    Tier C OpenAI models route through OpenAI directly.
+    """
+
+    openrouter_api_key: str = Field(
+        default_factory=lambda: _load_env_value(
+            "OPENROUTER_API_KEY",
+            "POLYMARKET_MODELS__OPENROUTER_API_KEY",
+        )
+    )
+    openai_api_key: str = Field(
+        default_factory=lambda: _load_env_value(
+            "OPENAI_API_KEY",
+            "POLYMARKET_MODELS__OPENAI_API_KEY",
+        )
+    )
+    anthropic_api_key: str = Field(
+        default_factory=lambda: _load_env_value(
+            "ANTHROPIC_API_KEY",
+            "POLYMARKET_MODELS__ANTHROPIC_API_KEY",
+        )
+    )
+    openrouter_base_url: str = Field(
+        default_factory=lambda: _load_env_value(
+            "OPENROUTER_BASE_URL",
+            "POLYMARKET_MODELS__OPENROUTER_BASE_URL",
+        )
+        or "https://openrouter.ai/api/v1"
+    )
 
     tier_a_model: str = "claude-opus-4-6"
     tier_b_model: str = "claude-sonnet-4-6"
@@ -139,8 +212,27 @@ class TelegramConfig(BaseSettings):
     """Telegram notification configuration."""
 
     bot_token: str = ""
-    chat_id: str = ""
+    chat_id: str = ""  # comma-separated list of pre-approved chat IDs
     enabled: bool = False
+
+    # Delivery
+    max_retries: int = 3
+    retry_base_delay_seconds: float = 1.0
+    dedup_window_seconds: int = 300  # 5-minute dedup window
+    request_timeout_seconds: float = 30.0
+
+
+class NotificationConfig(BaseSettings):
+    """Notification service configuration."""
+
+    # Whether to use LLM composer for complex messages (weekly, critical)
+    use_llm_composer: bool = False
+
+    # Severity routing: which severities trigger all-chat broadcast
+    broadcast_severities: list[str] = ["critical"]
+
+    # Rate limiting: max notifications per event type per hour
+    max_per_type_per_hour: int = 20
 
 
 class CalibrationConfig(BaseSettings):
@@ -157,6 +249,34 @@ class CalibrationConfig(BaseSettings):
     intermediate_week: int = 8
     decision_week: int = 12
     viability_min_forecasts: int = 50
+
+    # Cross-category pooling
+    pool_minimum_combined: int = 15
+    pool_minimum_individual: int = 5
+    pool_penalty_factor: float = 0.30
+
+    # Accumulation tracking
+    accumulation_lookback_weeks: int = 4
+
+
+class LearningConfig(BaseSettings):
+    """Learning system configuration."""
+
+    # Patience budget
+    patience_budget_months: int = 9
+
+    # No-trade rate monitoring
+    no_trade_low_threshold: float = 0.30
+    no_trade_high_threshold: float = 0.90
+
+    # Policy review
+    policy_min_sample_size: int = 20
+    policy_min_persistence_weeks: int = 3
+    early_deployment: bool = True
+
+    # Learning loop cadence (hours)
+    fast_loop_interval_hours: int = 24
+    slow_loop_interval_hours: int = 168  # weekly
 
 
 class PolymarketApiConfig(BaseSettings):
@@ -188,6 +308,62 @@ class PolymarketApiConfig(BaseSettings):
     consecutive_failure_threshold: int = 5
 
 
+class ExecutionConfig(BaseSettings):
+    """Execution engine configuration."""
+
+    # Pre-execution revalidation
+    max_approval_staleness_seconds: int = 300  # 5 minutes
+    staged_entry_depth_fraction: float = 0.05  # staged when > 5% of depth
+
+    # Friction model defaults
+    default_spread_estimate: float = 0.02
+    default_depth_assumption: float = 5000.0
+    default_impact_coefficient: float = 0.5
+
+    # Slippage recalibration
+    slippage_recalibration_ratio: float = 1.5
+    slippage_recalibration_window: int = 20
+    min_trades_for_calibration: int = 10
+
+    # Impact threshold for staged entry (bps)
+    high_impact_threshold_bps: float = 50.0
+
+
+class TradeabilityConfig(BaseSettings):
+    """Tradeability and resolution parser configuration."""
+
+    # Spread and depth hard limits
+    max_spread: float = 0.15
+    min_depth_for_min_position_usd: float = 50.0
+
+    # Ambiguity thresholds
+    max_ambiguous_phrases_marginal: int = 1  # 1 → marginal
+    max_ambiguous_phrases_reject: int = 4  # 4+ → auto-reject
+
+
+class PositionReviewConfig(BaseSettings):
+    """Position review scheduling and deterministic check thresholds."""
+
+    # Tier 1 (New): first N hours, every N hours
+    new_position_hours: float = 48.0
+    new_review_interval_hours: float = 3.0  # 2-4 hours, default 3
+
+    # Tier 2 (Stable): every N hours
+    stable_review_interval_hours: float = 7.0  # 6-8 hours, default 7
+    stable_no_trigger_hours: float = 24.0  # no triggers in 24h for stable
+
+    # Tier 3 (Low-value): every N hours
+    low_value_review_interval_hours: float = 12.0
+    low_value_percentile: float = 0.20  # bottom 20th percentile
+
+    # Deterministic check thresholds
+    price_adverse_move_threshold: float = 0.10  # 10% adverse move
+    max_spread_for_hold: float = 0.20  # max spread before flagging
+    min_depth_for_exit_usd: float = 100.0  # min depth for exit capability
+    catalyst_proximity_hours: float = 24.0  # flag when within 24h
+    horizon_warning_pct: float = 0.80  # warn at 80% of horizon
+
+
 class AbsenceConfig(BaseSettings):
     """Operator absence escalation thresholds."""
 
@@ -212,6 +388,7 @@ class AppConfig(BaseSettings):
     operator_mode: str = "paper"
     log_level: str = "INFO"
     config_path: Path | None = None
+    paper_balance_usd: float = 500.0
 
     # Sub-configs
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -223,7 +400,12 @@ class AppConfig(BaseSettings):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     absence: AbsenceConfig = Field(default_factory=AbsenceConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    tradeability: TradeabilityConfig = Field(default_factory=TradeabilityConfig)
     polymarket_api: PolymarketApiConfig = Field(default_factory=PolymarketApiConfig)
+    position_review: PositionReviewConfig = Field(default_factory=PositionReviewConfig)
+    learning: LearningConfig = Field(default_factory=LearningConfig)
+    notification: NotificationConfig = Field(default_factory=NotificationConfig)
 
 
 def load_config(config_path: Path | None = None) -> AppConfig:
