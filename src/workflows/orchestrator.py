@@ -312,17 +312,17 @@ class WorkflowOrchestrator:
 
         # 12. Wire dashboard API state
         try:
-            from dashboard_api.app import set_session_factory, set_app_config, _system_state
+            from dashboard_api.app import set_session_factory, set_app_config, _system_state, _persisted
             set_session_factory(session_factory)
             set_app_config(self._config)
             # Keep a live reference so pipeline decisions always use the current mode,
             # not the stale startup value from config.
             self._dashboard_state = _system_state
-            # Only set operator_mode from config if no persisted value exists.
-            # The dashboard API layer persists mode changes to disk, and we
-            # must not overwrite an operator-set mode on restart.
-            if "operator_mode" not in _system_state or _system_state["operator_mode"] is None:
+            # Persisted state (written by the dashboard) takes priority over config.
+            # Only fall back to the config value when no mode has been saved to disk.
+            if "operator_mode" not in _persisted:
                 _system_state["operator_mode"] = self._config.operator_mode
+            # else: _system_state already holds the dashboard-persisted mode — keep it.
             _system_state["system_status"] = "initializing"
             # Sync paper balance — only as default if not persisted
             balance = getattr(self._config, 'paper_balance_usd', 500.0)
@@ -922,8 +922,9 @@ class WorkflowOrchestrator:
                         )
                     # Only INVESTIGATE_NOW markets become active investigation candidates.
                     if result.outcome == EligibilityOutcome.INVESTIGATE_NOW.value:
-                        # Skip near-certainty markets — no exploitable edge
-                        market_price = market.price or market.mid_price
+                        # Skip near-certainty markets — no exploitable edge.
+                        # MarketInfo from discovery has no real-time price; use getattr safely.
+                        market_price = getattr(market, 'price', None) or getattr(market, 'mid_price', None)
                         if market_price is not None and (market_price < 0.04 or market_price > 0.96):
                             continue
                         eligible_candidates.append(
@@ -934,8 +935,8 @@ class WorkflowOrchestrator:
                                 category=result.category_classification.category or "unknown",
                                 trigger_class="discovery",
                                 trigger_level="C",
-                                price=market.price or market.mid_price or 0.5,
-                                mid_price=market.mid_price or market.price or 0.5,
+                                price=getattr(market, 'price', None) or getattr(market, 'mid_price', None) or 0.5,
+                                mid_price=getattr(market, 'mid_price', None) or getattr(market, 'price', None) or 0.5,
                                 spread=elig_input.spread,
                                 visible_depth_usd=elig_input.liquidity_usd,
                                 description=market.description,

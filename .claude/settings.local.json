@@ -73,7 +73,15 @@
       "Bash(curl -s http://localhost:8000/)",
       "Bash(curl -s http://localhost:8000/openapi.json)",
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(k\\) for k in d.get\\('paths',{}\\).keys\\(\\)]\")",
-      "Bash(curl -s http://localhost:8000/api/portfolio)"
+      "Bash(curl -s http://localhost:8000/api/portfolio)",
+      "Bash(curl -s http://localhost:8000/api/health)",
+      "Bash(curl -s http://localhost:8000/api/workflows)",
+      "Bash(python3 -m json.tool curl -s http://localhost:8000/api/positions)",
+      "Bash(curl -s http://localhost:8000/api/scanner)",
+      "Bash(curl -s http://localhost:8000/api/activity?limit=20)",
+      "Bash(curl -s \"http://localhost:8000/api/activity?limit=20\")",
+      "Bash(curl -s http://localhost:8000/api/cost)",
+      "Bash(curl -s http://localhost:8000/api/system-health)"
     ]
   }
 }

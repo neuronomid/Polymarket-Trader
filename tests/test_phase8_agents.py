@@ -1466,6 +1466,60 @@ class TestAgentBase:
         assert captured_input["calibration_regime"] == CalibrationRegime.VIABILITY_UNCERTAIN
         assert captured_input["sports_quality_gated"] is True
 
+    @pytest.mark.asyncio
+    async def test_base_agent_run_tracks_calls_from_nested_result(self):
+        from agents.base import BaseAgent
+        from agents.providers import LLMResponse, ProviderRouter
+        from agents.types import AgentInput, AgentResult, LLMCallRecord
+
+        router = ProviderRouter()
+        router.call = AsyncMock(
+            return_value=(
+                LLMResponse(
+                    content='{"ok": true}',
+                    input_tokens=10,
+                    output_tokens=5,
+                    model="gpt-5.4-nano",
+                    provider="openai",
+                ),
+                LLMCallRecord(
+                    call_id="call-1",
+                    workflow_run_id="wf-1",
+                    agent_role="evidence_research",
+                    provider="openai",
+                    model="gpt-5.4-nano",
+                    tier=ModelTier.C,
+                    cost_class=CostClass.L,
+                    input_tokens=10,
+                    output_tokens=5,
+                    actual_cost_usd=0.01,
+                ),
+            )
+        )
+
+        class NestedResultAgent(BaseAgent):
+            role_name = "evidence_research"
+
+            async def _execute(self, agent_input, regime):
+                nested_result = AgentResult(agent_role=self.role_name)
+                await self.call_llm(
+                    agent_input,
+                    user_prompt="test",
+                    regime=regime,
+                    result=nested_result,
+                )
+                return {"nested_cost": nested_result.total_cost_usd}
+
+        agent = NestedResultAgent(router=router)
+        result = await agent.run(AgentInput(workflow_run_id="wf-1"))
+
+        assert result.success is True
+        assert result.result["nested_cost"] == 0.01
+        assert result.total_cost_usd == 0.01
+        assert result.total_input_tokens == 10
+        assert result.total_output_tokens == 5
+        assert len(result.call_records) == 1
+
 
 # =============================================================================
 # 9. Integration Tests

@@ -404,6 +404,21 @@ class TestDashboardServiceDB:
         assert overview.total_open_exposure_usd == 0.0
         assert overview.unrealized_pnl_usd == 0.0
 
+    async def test_portfolio_uses_mark_to_market_paper_equity(self, session: AsyncSession):
+        """Portfolio overview prefers simulated equity over static paper balance."""
+        service = DashboardService(
+            session=session,
+            system_state={
+                "paper_balance_usd": 500.0,
+                "paper_equity_usd": 545.0,
+                "operator_mode": "paper",
+                "system_status": "running",
+                "equity_history": [],
+            },
+        )
+        overview = await service.get_portfolio_overview()
+        assert overview.total_equity_usd == 545.0
+
     async def test_get_positions_all(self, populated_session):
         """Get all positions returns correct count."""
         session, _, _, _, _, _ = populated_session

@@ -132,7 +132,7 @@ export default function Dashboard() {
   });
   const [agentsRunning, setAgentsRunning] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
+  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [showModePanel, setShowModePanel] = useState(false);
   const [showBalancePanel, setShowBalancePanel] = useState(false);
   const [balanceInput, setBalanceInput] = useState("");
@@ -483,7 +483,7 @@ export default function Dashboard() {
                 title="Refresh now"
               >
                 <RefreshCw size={10} />
-                {lastRefresh.toLocaleTimeString()}
+                {lastRefresh ? lastRefresh.toLocaleTimeString() : "--:--:--"}
               </button>
             </div>
           </div>

@@ -95,7 +95,10 @@ class DashboardService:
         ]
 
         return PortfolioOverview(
-            total_equity_usd=self._system_state.get("paper_balance_usd", 500.0),
+            total_equity_usd=self._system_state.get(
+                "paper_equity_usd",
+                self._system_state.get("paper_balance_usd", 500.0),
+            ),
             total_open_exposure_usd=float(row.exposure),
             daily_pnl_usd=float(row.unrealized) + float(row.realized),
             unrealized_pnl_usd=float(row.unrealized),
@@ -249,7 +252,47 @@ class DashboardService:
     async def get_workflow_runs(
         self, limit: int = 20, offset: int = 0
     ) -> list[WorkflowRunSummary]:
-        """Get recent workflow run summaries from in-memory state."""
+        """Get recent workflow run summaries.
+
+        Prefer persisted DB rows so runs survive process restarts. Fall back to
+        the live in-memory activity buffer when the DB has no rows yet.
+        """
+        from data.models import Market
+        from data.models.thesis import ThesisCard
+        from data.models.workflow import WorkflowRun
+
+        query = (
+            select(
+                WorkflowRun,
+                Market.title,
+                func.count(ThesisCard.id).label("accepted_count"),
+            )
+            .outerjoin(Market, WorkflowRun.market_id == Market.id)
+            .outerjoin(ThesisCard, ThesisCard.workflow_run_id == WorkflowRun.id)
+            .group_by(WorkflowRun.id, Market.title)
+            .order_by(WorkflowRun.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self._session.execute(query)
+        rows = result.all()
+
+        if rows:
+            return [
+                WorkflowRunSummary(
+                    id=run.id,
+                    workflow_type=run.run_type,
+                    status=run.status,
+                    started_at=run.started_at,
+                    completed_at=run.completed_at,
+                    cost_usd=run.actual_cost_usd or 0.0,
+                    candidates_reviewed=0,
+                    candidates_accepted=int(accepted_count or 0),
+                    market_title=title,
+                )
+                for run, title, accepted_count in rows
+            ]
+
         import uuid as _uuid
         runs = self._system_state.get("workflow_runs", [])
         # Most recent first, then paginate
@@ -274,7 +317,41 @@ class DashboardService:
     async def get_trigger_events(
         self, limit: int = 50, offset: int = 0
     ) -> list[TriggerEventItem]:
-        """Get recent trigger events from in-memory state."""
+        """Get recent trigger events.
+
+        Prefer persisted DB rows so trigger history survives process restarts.
+        Fall back to the in-memory activity buffer when needed.
+        """
+        from data.models import Market
+        from data.models.workflow import TriggerEvent
+
+        query = (
+            select(TriggerEvent, Market.title, Market.market_id)
+            .join(Market, TriggerEvent.market_id == Market.id)
+            .order_by(TriggerEvent.triggered_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self._session.execute(query)
+        rows = result.all()
+
+        if rows:
+            return [
+                TriggerEventItem(
+                    id=evt.id,
+                    trigger_class=evt.trigger_class,
+                    trigger_level=evt.trigger_level,
+                    market_id=market_id,
+                    market_title=title,
+                    reason=evt.reason,
+                    price=evt.price_at_trigger,
+                    spread=evt.spread_at_trigger,
+                    data_source=evt.data_source,
+                    timestamp=evt.triggered_at,
+                )
+                for evt, title, market_id in rows
+            ]
+
         import uuid as _uuid
         events = self._system_state.get("trigger_events", [])
         events_page = list(reversed(events))[offset : offset + limit]

@@ -796,6 +796,8 @@ class TestTriggerScannerIntegration:
         service = AsyncMock()
         service.poll_batch = AsyncMock(return_value={})
         service.run_eviction = AsyncMock(return_value=0)
+        service.get_failure_count = MagicMock(return_value=0)
+        service.get_failure_threshold = MagicMock(return_value=3)
         return service
 
     @pytest.fixture

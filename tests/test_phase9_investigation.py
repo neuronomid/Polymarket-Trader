@@ -1236,6 +1236,41 @@ class TestInvestigationOrchestrator:
             result = await orchestrator.run(request)
             assert result.outcome != InvestigationOutcome.COST_REJECTED
 
+    @pytest.mark.asyncio
+    async def test_actual_cost_includes_rejected_candidate_spend(
+        self, mock_router, mock_cost_governor, sample_candidate,
+    ):
+        orchestrator = InvestigationOrchestrator(
+            router=mock_router,
+            cost_governor=mock_cost_governor,
+        )
+
+        async def fake_investigate_candidate(*args, **kwargs):
+            agent_costs = kwargs["agent_costs"]
+            agent_costs["domain_manager_macro_policy"] = 0.022596
+            agent_costs["evidence_research"] = 0.0035
+            return None
+
+        with patch.object(
+            orchestrator,
+            "_investigate_candidate",
+            new=AsyncMock(side_effect=fake_investigate_candidate),
+        ):
+            request = InvestigationRequest(
+                workflow_run_id="wf-006",
+                mode=InvestigationMode.TRIGGER_BASED,
+                candidates=[sample_candidate],
+                max_candidates=1,
+            )
+            result = await orchestrator.run(request)
+
+        assert result.outcome == InvestigationOutcome.NO_TRADE
+        assert result.actual_cost_usd == 0.026096
+        assert result.agent_costs == {
+            "domain_manager_macro_policy": 0.022596,
+            "evidence_research": 0.0035,
+        }
+
 
 # ============================================================
 # 10. Integration: Full Module Import Test
