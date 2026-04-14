@@ -305,6 +305,16 @@ class TriggerScanner:
                 markets_scanned=len(poll_results),
             )
 
+        # Evict dead tokens that have exceeded the failure threshold
+        failure_threshold = self._market_data.get_failure_threshold()
+        dead_tokens = [
+            tid for tid in list(self._watch_list.keys())
+            if self._market_data.get_failure_count(tid) >= failure_threshold
+        ]
+        for tid in dead_tokens:
+            self.remove_from_watch_list(tid)
+            self._log.info("watch_list_evict_dead_token", token_id=tid, consecutive_failures=failure_threshold)
+
         # Invoke callback if set
         if self._trigger_callback and all_triggers:
             try:

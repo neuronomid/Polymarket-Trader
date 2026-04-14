@@ -181,8 +181,7 @@ export function OverviewPage({ data }: { data: DashboardData }) {
       </div>
 
       {/* Charts Grid */}
-      {filteredEquityData.length > 0 && (
-        <div className="content-grid" style={{ marginTop: "1rem" }}>
+      <div className="content-grid" style={{ marginTop: "1rem" }}>
           <div className="card fade-in" style={{ gridColumn: "span 2" }}>
             <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
@@ -211,6 +210,12 @@ export function OverviewPage({ data }: { data: DashboardData }) {
               </div>
             </div>
             <div style={{ height: 220 }}>
+              {filteredEquityData.length === 0 ? (
+                <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: "0.5rem" }}>
+                  <TrendingUp size={24} color="var(--text-dim)" />
+                  <span style={{ color: "var(--text-dim)", fontSize: "0.75rem" }}>Collecting equity data — updates every 5 minutes</span>
+                </div>
+              ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={filteredEquityData}>
                   <defs>
@@ -233,10 +238,10 @@ export function OverviewPage({ data }: { data: DashboardData }) {
                   />
                 </AreaChart>
               </ResponsiveContainer>
+              )}
             </div>
           </div>
         </div>
-      )}
 
       <div className="content-grid">
         {/* Activity Feed */}

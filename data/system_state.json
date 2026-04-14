@@ -1,3 +1,5 @@
 {
-  "operator_mode": "paper"
+  "operator_mode": "paper",
+  "paper_balance_usd": 500.0,
+  "start_of_day_equity_usd": 500.0
 }

@@ -99,6 +99,10 @@ class WorkflowOrchestrator:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._state = SystemState(operator_mode=config.operator_mode)
+        # Live reference to the dashboard's shared state dict — populated in initialize().
+        # Used so that mode changes made via the dashboard are respected by the pipeline
+        # without requiring a restart.
+        self._dashboard_state: dict[str, Any] | None = None
 
         # --- Subsystems (initialized in initialize()) ---
         # Core infrastructure
@@ -232,10 +236,13 @@ class WorkflowOrchestrator:
         # 9. Calibration & learning subsystems
         self._calibration_store = CalibrationStore()
         self._brier_engine = BrierEngine(self._calibration_store)
-        self._segment_manager = SegmentManager(self._config.calibration)
+        self._segment_manager = SegmentManager(
+            store=self._calibration_store,
+            config=self._config.calibration,
+        )
         self._accumulation_tracker = AccumulationTracker(
-            self._segment_manager,
-            self._config.calibration,
+            store=self._calibration_store,
+            segment_manager=self._segment_manager,
         )
         self._friction_calibrator = FrictionCalibrator()
         self._no_trade_monitor = NoTradeMonitor()
@@ -294,6 +301,9 @@ class WorkflowOrchestrator:
             from dashboard_api.app import set_session_factory, set_app_config, _system_state
             set_session_factory(session_factory)
             set_app_config(self._config)
+            # Keep a live reference so pipeline decisions always use the current mode,
+            # not the stale startup value from config.
+            self._dashboard_state = _system_state
             # Only set operator_mode from config if no persisted value exists.
             # The dashboard API layer persists mode changes to disk, and we
             # must not overwrite an operator-set mode on restart.
@@ -422,6 +432,22 @@ class WorkflowOrchestrator:
             detail=f"Batch {batch.batch_id}",
         )
 
+        # Persist ALL triggers (including non-actionable) to the dashboard state
+        try:
+            from dashboard_api.app import _add_trigger_event
+            for t in batch.triggers:
+                _add_trigger_event(
+                    trigger_class=t.trigger_class.value if hasattr(t.trigger_class, "value") else str(t.trigger_class),
+                    trigger_level=t.trigger_level.value if hasattr(t.trigger_level, "value") else str(t.trigger_level),
+                    market_id=t.market_id or t.token_id,
+                    reason=t.reason or "",
+                    price=t.price,
+                    spread=t.spread,
+                    data_source=getattr(t, "data_source", "live"),
+                )
+        except Exception:
+            pass
+
         actionable = batch.actionable_triggers
         if not actionable:
             return
@@ -473,6 +499,14 @@ class WorkflowOrchestrator:
             async with self._pipeline_lock:
                 await self._run_trigger_pipeline(investigation_triggers, batch)
 
+    def _current_mode(self) -> OperatorMode:
+        """Return the live operator mode, respecting dashboard changes made at runtime."""
+        if self._dashboard_state is not None:
+            raw = self._dashboard_state.get("operator_mode", self._config.operator_mode)
+        else:
+            raw = self._config.operator_mode
+        return OperatorMode(raw)
+
     async def _run_trigger_pipeline(
         self,
         triggers: list,
@@ -500,12 +534,27 @@ class WorkflowOrchestrator:
             return
 
         # Create investigation request
+        run_id = f"trig-{batch.batch_id}-{uuid.uuid4().hex[:6]}"
         request = InvestigationRequest(
-            workflow_run_id=f"trig-{batch.batch_id}-{uuid.uuid4().hex[:6]}",
+            workflow_run_id=run_id,
             mode=InvestigationMode.TRIGGER_BASED,
             candidates=candidates,
             max_candidates=3,
         )
+
+        # Record workflow start
+        run_started = datetime.now(tz=UTC)
+        try:
+            from dashboard_api.app import _add_workflow_run
+            _add_workflow_run(
+                workflow_run_id=run_id,
+                workflow_type="trigger_based",
+                status="running",
+                candidates_reviewed=len(candidates),
+                started_at=run_started,
+            )
+        except Exception:
+            pass
 
         # Run investigation
         try:
@@ -519,11 +568,31 @@ class WorkflowOrchestrator:
                 regime=self._build_regime_context(),
             )
 
+            run_cost = getattr(result, "actual_cost_usd", 0.0) or 0.0
+
+            # Update workflow run as completed
+            try:
+                from dashboard_api.app import _add_workflow_run, _record_agent_invocation
+                _add_workflow_run(
+                    workflow_run_id=run_id,
+                    workflow_type="trigger_based",
+                    status="completed",
+                    candidates_reviewed=len(candidates),
+                    candidates_accepted=len(getattr(result, "thesis_cards", [])),
+                    cost_usd=run_cost,
+                    started_at=run_started,
+                    completed_at=datetime.now(tz=UTC),
+                )
+                if run_cost > 0:
+                    _record_agent_invocation("investigator_orchestration", run_cost)
+            except Exception:
+                pass
+
             # Record no-trade decisions
             if result.no_trade_results:
                 self._state.total_no_trade_decisions += len(result.no_trade_results)
                 for nt in result.no_trade_results:
-                    self._no_trade_monitor.record(accepted=False)
+                    self._no_trade_monitor.record_run(had_no_trade=True)
                     self._log_activity(
                         "trade", "Investigator",
                         f"No-trade: {getattr(nt, 'reason', 'insufficient edge')}",
@@ -536,7 +605,7 @@ class WorkflowOrchestrator:
 
             # Process accepted thesis cards through remaining pipeline
             for card in result.thesis_cards:
-                self._no_trade_monitor.record(accepted=True)
+                self._no_trade_monitor.record_run(had_no_trade=False)
                 self._log_activity(
                     "trade", "Investigator",
                     f"Thesis card accepted: {getattr(card, 'title', '?')[:60]}",
@@ -563,6 +632,17 @@ class WorkflowOrchestrator:
             self._state.recent_errors.append(
                 f"Pipeline error: {str(exc)[:200]}"
             )
+            try:
+                from dashboard_api.app import _add_workflow_run
+                _add_workflow_run(
+                    workflow_run_id=run_id,
+                    workflow_type="trigger_based",
+                    status="failed",
+                    started_at=run_started,
+                    completed_at=datetime.now(tz=UTC),
+                )
+            except Exception:
+                pass
 
     async def _process_thesis_card(self, card: Any) -> PipelineResult:
         """Process a thesis card through tradeability → risk → cost → execution.
@@ -617,7 +697,7 @@ class WorkflowOrchestrator:
             )
 
         # --- Stage 3: Paper/Shadow mode → log but don't execute ---
-        mode = OperatorMode(self._config.operator_mode)
+        mode = self._current_mode()
         if mode in (OperatorMode.PAPER, OperatorMode.SHADOW):
             _log.info(
                 "paper_mode_trade_decision",
@@ -686,12 +766,29 @@ class WorkflowOrchestrator:
             # Discover active markets
             markets = await self._market_data.discover_markets()
 
+            # Pre-filter to the eligible horizon window (24h–90d) and sort by
+            # liquidity descending so we check the most active markets first.
+            _now = datetime.now(tz=UTC)
+            _min_horizon = timedelta(hours=self._config.eligibility.min_horizon_hours)
+            _max_horizon = timedelta(days=self._config.eligibility.max_horizon_days)
+            markets_filtered = [
+                m for m in markets
+                if m.end_date is None or _min_horizon <= (m.end_date - _now) <= _max_horizon
+            ]
+            markets_filtered.sort(key=lambda m: m.liquidity or 0.0, reverse=True)
+
+            _log.info(
+                "sweep_market_pool",
+                total=len(markets),
+                after_horizon_filter=len(markets_filtered),
+            )
+
             # Build eligibility inputs and evaluate
             eligible_candidates: list[CandidateContext] = []
-            for market in markets[:50]:  # cap to prevent overload
+            for market in markets_filtered[:50]:  # cap to prevent overload
                 elig_input = MarketEligibilityInput(
                     market_id=market.market_id or str(uuid.uuid4()),
-                    title=market.question or market.title or "",
+                    title=market.title or "",
                     description=market.description or "",
                     category_raw=market.category or "",
                     slug=market.slug or "",
@@ -699,28 +796,18 @@ class WorkflowOrchestrator:
                     liquidity_usd=market.liquidity or 0.0,
                     spread=market.spread or 0.0,
                     end_date=market.end_date,
+                    resolution_source=market.resolution_source or "polymarket.com",
                 )
 
                 result = self._eligibility.evaluate(elig_input)
 
-                if result.outcome == EligibilityOutcome.INVESTIGATE_NOW.value:
+                watchlist_outcomes = {
+                    EligibilityOutcome.INVESTIGATE_NOW.value,
+                    EligibilityOutcome.TRIGGER_ELIGIBLE.value,
+                }
+                if result.outcome in watchlist_outcomes:
                     token_id = market.token_ids[0] if market.token_ids else ""
-                    eligible_candidates.append(
-                        CandidateContext(
-                            market_id=elig_input.market_id,
-                            token_id=token_id,
-                            title=elig_input.title,
-                            category=result.category_classification.category or "unknown",
-                            trigger_class="discovery",
-                            trigger_level="C",
-                            price=0.5,
-                            mid_price=0.5,
-                            spread=elig_input.spread,
-                            visible_depth_usd=elig_input.liquidity_usd,
-                        )
-                    )
-                    # Register eligible markets with the scanner watch list so
-                    # trigger-based monitoring picks up subsequent price moves.
+                    # All watchlist-eligible markets go on the scanner watch list.
                     if token_id:
                         self._scanner.add_to_watch_list(
                             MarketWatchEntry(
@@ -730,11 +817,28 @@ class WorkflowOrchestrator:
                                 last_spread=elig_input.spread,
                             )
                         )
+                    # Only INVESTIGATE_NOW markets become active investigation candidates.
+                    if result.outcome == EligibilityOutcome.INVESTIGATE_NOW.value:
+                        eligible_candidates.append(
+                            CandidateContext(
+                                market_id=elig_input.market_id,
+                                token_id=token_id,
+                                title=elig_input.title,
+                                category=result.category_classification.category or "unknown",
+                                trigger_class="discovery",
+                                trigger_level="C",
+                                price=0.5,
+                                mid_price=0.5,
+                                spread=elig_input.spread,
+                                visible_depth_usd=elig_input.liquidity_usd,
+                            )
+                        )
 
             _log.info(
                 "sweep_eligibility_complete",
-                markets_checked=min(len(markets), 50),
+                markets_checked=min(len(markets_filtered), 50),
                 eligible=len(eligible_candidates),
+                watch_list_size=self._scanner.get_watch_list().__len__(),
             )
 
             if not eligible_candidates:
@@ -742,18 +846,50 @@ class WorkflowOrchestrator:
                 return
 
             # Run investigation on top candidates
+            sweep_run_id = f"sweep-{uuid.uuid4().hex[:8]}"
+            sweep_started = datetime.now(tz=UTC)
             request = InvestigationRequest(
-                workflow_run_id=f"sweep-{uuid.uuid4().hex[:8]}",
+                workflow_run_id=sweep_run_id,
                 mode=InvestigationMode.SCHEDULED_SWEEP,
                 candidates=eligible_candidates[:10],
                 max_candidates=3,
             )
+
+            try:
+                from dashboard_api.app import _add_workflow_run
+                _add_workflow_run(
+                    workflow_run_id=sweep_run_id,
+                    workflow_type="scheduled_sweep",
+                    status="running",
+                    candidates_reviewed=len(eligible_candidates[:10]),
+                    started_at=sweep_started,
+                )
+            except Exception:
+                pass
 
             self._state.total_investigations += 1
             result = await self._investigator.run(
                 request,
                 regime=self._build_regime_context(),
             )
+
+            sweep_cost = getattr(result, "actual_cost_usd", 0.0) or 0.0
+            try:
+                from dashboard_api.app import _add_workflow_run, _record_agent_invocation
+                _add_workflow_run(
+                    workflow_run_id=sweep_run_id,
+                    workflow_type="scheduled_sweep",
+                    status="completed",
+                    candidates_reviewed=len(eligible_candidates[:10]),
+                    candidates_accepted=len(getattr(result, "thesis_cards", [])),
+                    cost_usd=sweep_cost,
+                    started_at=sweep_started,
+                    completed_at=datetime.now(tz=UTC),
+                )
+                if sweep_cost > 0:
+                    _record_agent_invocation("investigator_orchestration", sweep_cost)
+            except Exception:
+                pass
 
             for card in result.thesis_cards:
                 await self._process_thesis_card(card)
@@ -837,14 +973,14 @@ class WorkflowOrchestrator:
             as_of=datetime.now(tz=UTC),
             new_resolutions=0,  # populated from DB in production
             trades_since_friction_check=0,
-            daily_spend_usd=budget_state.daily_spend_usd,
+            daily_spend_usd=budget_state.daily_spent_usd,
             trades_entered_today=0,
             cost_selectivity_ratio=selectivity.cost_to_edge_ratio,
             daily_budget_remaining_pct=(
                 budget_state.daily_remaining_usd / max(budget_state.daily_budget_usd, 0.01)
             ),
             lifetime_budget_consumed_pct=(
-                budget_state.lifetime_spend_usd / max(budget_state.lifetime_budget_usd, 0.01)
+                budget_state.lifetime_spent_usd / max(budget_state.lifetime_budget_usd, 0.01)
             ),
             operator_absent=absence_state.absence_level.value >= 1,
             absence_hours=absence_state.hours_since_last_interaction,
@@ -928,7 +1064,7 @@ class WorkflowOrchestrator:
         return RegimeContext(
             calibration=calibration,
             cost_selectivity_ratio=selectivity.cost_to_edge_ratio if selectivity else 0.0,
-            operator_mode=OperatorMode(self._config.operator_mode),
+            operator_mode=self._current_mode(),
         )
 
     def _build_resolution_input(self, card: Any) -> Any:
@@ -1008,8 +1144,11 @@ class WorkflowOrchestrator:
 
             if self._cost_governor:
                 budget = self._cost_governor.budget_tracker.state
-                _system_state["daily_spend_usd"] = round(budget.daily_spend_usd, 4)
-                _system_state["lifetime_spend_usd"] = round(budget.lifetime_spend_usd, 4)
+                _system_state["daily_spend_usd"] = round(budget.daily_spent_usd, 4)
+                _system_state["lifetime_spend_usd"] = round(budget.lifetime_spent_usd, 4)
+                _system_state["opus_spend_today_usd"] = round(
+                    getattr(budget, "daily_opus_spent_usd", 0.0), 4
+                )
 
                 selectivity = self._cost_governor.get_selectivity_snapshot()
                 _system_state["selectivity_ratio"] = round(
@@ -1020,6 +1159,39 @@ class WorkflowOrchestrator:
                 drawdown = self._risk_governor.drawdown_state
                 _system_state["drawdown_level"] = drawdown.level.value
                 _system_state["drawdown_pct"] = round(drawdown.current_drawdown_pct, 4)
+
+            # Equity snapshot for the chart (taken every sync cycle, ~5 min)
+            try:
+                from dashboard_api.app import _add_equity_snapshot
+                equity = _system_state.get(
+                    "paper_balance_usd", self._portfolio.current_equity_usd
+                )
+                start_equity = _system_state.get(
+                    "start_of_day_equity_usd", self._portfolio.start_of_day_equity_usd
+                )
+                _add_equity_snapshot(
+                    equity_usd=round(float(equity), 2),
+                    pnl_usd=round(float(equity) - float(start_equity), 2),
+                )
+            except Exception:
+                pass
+
+            # Scanner cache/failure metrics (augment what the health block already set)
+            if self._scanner:
+                try:
+                    health = self._scanner.health_monitor.get_health_status()
+                    _system_state["scanner_cache_entries"] = getattr(
+                        health, "cache_entries_count", 0
+                    )
+                    _system_state["scanner_cache_hit_rate"] = getattr(
+                        health, "cache_hit_rate", 0.0
+                    )
+                    _system_state["scanner_consecutive_failures"] = getattr(
+                        health, "consecutive_failures", 0
+                    )
+                    _system_state["scanner_last_poll"] = datetime.now(tz=UTC).isoformat()
+                except Exception:
+                    pass
 
         except Exception as exc:
             _log.debug("dashboard_sync_error", error=str(exc))
@@ -1054,7 +1226,12 @@ class WorkflowOrchestrator:
         await self._emit_event(
             NotificationType.SYSTEM_HEALTH,
             NotificationSeverity.INFO,
-            payload={"event": event, "detail": detail},
+            payload={
+                "health_event": event,
+                "service": "orchestrator",
+                "summary": detail,
+                "detail": detail,
+            },
         )
 
     async def _emit_no_trade_event(self, no_trade: Any) -> None:
@@ -1064,9 +1241,12 @@ class WorkflowOrchestrator:
             NotificationSeverity.INFO,
             market_id=getattr(no_trade, "market_id", None),
             payload={
-                "reason": getattr(no_trade, "reason", ""),
-                "reason_code": getattr(no_trade, "reason_code", ""),
-                "stage": getattr(no_trade, "stage", ""),
+                "reason": getattr(no_trade, "reason", "healthy_no_trade"),
+                "workflow_run_duration_seconds": 0.0,
+                "candidates_reviewed": 1,
+                "top_rejected_market": getattr(no_trade, "market_id", None),
+                "rejection_reasons": [getattr(no_trade, "reason_code", "")],
+                "is_healthy": True,
             },
         )
 

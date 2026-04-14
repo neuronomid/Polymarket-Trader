@@ -275,3 +275,7 @@ class MarketDataService:
     def get_failure_count(self, token_id: str) -> int:
         """Get the current consecutive failure count for a market."""
         return self._consecutive_failures.get(token_id, 0)
+
+    def get_failure_threshold(self) -> int:
+        """Get the consecutive failure threshold for eviction decisions."""
+        return self._failure_threshold

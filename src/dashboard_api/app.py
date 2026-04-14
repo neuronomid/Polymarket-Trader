@@ -115,6 +115,14 @@ _system_state: dict[str, Any] = {
     "paper_transactions": [],
     # Activity log (circular buffer, last 200 events)
     "activity_log": [],
+    # Live pipeline data (circular buffers, never written to DB from orchestrator)
+    "trigger_events": [],   # last 100 scanner triggers
+    "workflow_runs": [],    # last 50 workflow runs
+    "equity_history": [],   # time-series equity snapshots (last 500)
+    # Per-agent invocation/cost counters keyed by role
+    "agent_invocations": {},
+    "agent_costs": {},
+    "agent_last_invoked": {},
 }
 
 
@@ -611,3 +619,102 @@ def _add_activity(
     # Keep only last 200 entries
     if len(log) > 200:
         _system_state["activity_log"] = log[-200:]
+
+
+def _add_trigger_event(
+    trigger_class: str,
+    trigger_level: str,
+    market_id: str | None,
+    reason: str,
+    price: float | None = None,
+    spread: float | None = None,
+    data_source: str | None = "live",
+    market_title: str | None = None,
+) -> None:
+    """Record a scanner trigger event in the in-memory store."""
+    import uuid as _uuid
+    entry = {
+        "id": str(_uuid.uuid4()),
+        "trigger_class": trigger_class,
+        "trigger_level": trigger_level,
+        "market_id": market_id,
+        "market_title": market_title,
+        "reason": reason,
+        "price": price,
+        "spread": spread,
+        "data_source": data_source,
+        "timestamp": datetime.now(tz=UTC).isoformat(),
+    }
+    events = _system_state.setdefault("trigger_events", [])
+    events.append(entry)
+    if len(events) > 100:
+        _system_state["trigger_events"] = events[-100:]
+
+
+def _add_workflow_run(
+    workflow_run_id: str,
+    workflow_type: str,
+    status: str = "running",
+    candidates_reviewed: int = 0,
+    candidates_accepted: int = 0,
+    cost_usd: float = 0.0,
+    started_at: datetime | None = None,
+    completed_at: datetime | None = None,
+    market_title: str | None = None,
+) -> str:
+    """Add or update a workflow run record. Returns the workflow_run_id."""
+    import uuid as _uuid
+    runs = _system_state.setdefault("workflow_runs", [])
+    # Update existing run if it already exists
+    for run in runs:
+        if run.get("workflow_run_id") == workflow_run_id:
+            run["status"] = status
+            if candidates_reviewed:
+                run["candidates_reviewed"] = candidates_reviewed
+            if candidates_accepted:
+                run["candidates_accepted"] = candidates_accepted
+            if cost_usd:
+                run["cost_usd"] = cost_usd
+            if completed_at:
+                run["completed_at"] = completed_at.isoformat()
+            return workflow_run_id
+    # New run
+    entry = {
+        "id": str(_uuid.uuid4()),
+        "workflow_run_id": workflow_run_id,
+        "workflow_type": workflow_type,
+        "status": status,
+        "started_at": (started_at or datetime.now(tz=UTC)).isoformat(),
+        "completed_at": completed_at.isoformat() if completed_at else None,
+        "cost_usd": cost_usd,
+        "candidates_reviewed": candidates_reviewed,
+        "candidates_accepted": candidates_accepted,
+        "market_title": market_title,
+    }
+    runs.append(entry)
+    if len(runs) > 50:
+        _system_state["workflow_runs"] = runs[-50:]
+    return workflow_run_id
+
+
+def _add_equity_snapshot(equity_usd: float, pnl_usd: float) -> None:
+    """Append a time-stamped equity snapshot for the chart."""
+    entry = {
+        "timestamp": datetime.now(tz=UTC).isoformat(),
+        "equity_usd": equity_usd,
+        "pnl_usd": pnl_usd,
+    }
+    history = _system_state.setdefault("equity_history", [])
+    history.append(entry)
+    if len(history) > 500:
+        _system_state["equity_history"] = history[-500:]
+
+
+def _record_agent_invocation(role: str, cost_usd: float = 0.0) -> None:
+    """Increment per-agent invocation counter and accumulate cost."""
+    invocations = _system_state.setdefault("agent_invocations", {})
+    costs = _system_state.setdefault("agent_costs", {})
+    last = _system_state.setdefault("agent_last_invoked", {})
+    invocations[role] = invocations.get(role, 0) + 1
+    costs[role] = round(costs.get(role, 0.0) + cost_usd, 6)
+    last[role] = datetime.now(tz=UTC).isoformat()

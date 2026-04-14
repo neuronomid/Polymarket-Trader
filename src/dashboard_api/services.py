@@ -83,6 +83,17 @@ class DashboardService:
         )
         row = result.one()
 
+        # Build equity history from in-memory snapshots
+        raw_history = self._system_state.get("equity_history", [])
+        equity_history = [
+            EquitySnapshot(
+                timestamp=snap["timestamp"],
+                equity_usd=snap["equity_usd"],
+                pnl_usd=snap["pnl_usd"],
+            )
+            for snap in raw_history
+        ]
+
         return PortfolioOverview(
             total_equity_usd=self._system_state.get("paper_balance_usd", 500.0),
             total_open_exposure_usd=float(row.exposure),
@@ -94,6 +105,7 @@ class DashboardService:
             drawdown_pct=self._system_state.get("drawdown_pct", 0.0),
             operator_mode=self._system_state.get("operator_mode", "paper"),
             system_status=self._system_state.get("system_status", "running"),
+            equity_history=equity_history,
         )
 
     # ─── Positions ────────────────────────────────────
@@ -237,27 +249,24 @@ class DashboardService:
     async def get_workflow_runs(
         self, limit: int = 20, offset: int = 0
     ) -> list[WorkflowRunSummary]:
-        """Get recent workflow run summaries."""
-        from data.models.workflow import WorkflowRun
-
-        result = await self._session.execute(
-            select(WorkflowRun)
-            .order_by(WorkflowRun.created_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
-        runs = result.scalars().all()
-
+        """Get recent workflow run summaries from in-memory state."""
+        import uuid as _uuid
+        runs = self._system_state.get("workflow_runs", [])
+        # Most recent first, then paginate
+        runs_page = list(reversed(runs))[offset : offset + limit]
         return [
             WorkflowRunSummary(
-                id=run.id,
-                workflow_type=run.run_type,
-                status=run.status,
-                started_at=run.started_at,
-                completed_at=run.completed_at,
-                cost_usd=run.actual_cost_usd or 0.0,
+                id=_uuid.UUID(r["id"]),
+                workflow_type=r["workflow_type"],
+                status=r["status"],
+                started_at=r.get("started_at"),
+                completed_at=r.get("completed_at"),
+                cost_usd=r.get("cost_usd", 0.0),
+                candidates_reviewed=r.get("candidates_reviewed", 0),
+                candidates_accepted=r.get("candidates_accepted", 0),
+                market_title=r.get("market_title"),
             )
-            for run in runs
+            for r in runs_page
         ]
 
     # ─── Trigger Events ──────────────────────────────
@@ -265,30 +274,24 @@ class DashboardService:
     async def get_trigger_events(
         self, limit: int = 50, offset: int = 0
     ) -> list[TriggerEventItem]:
-        """Get recent trigger events from scanner."""
-        from data.models.workflow import TriggerEvent
-
-        result = await self._session.execute(
-            select(TriggerEvent)
-            .order_by(TriggerEvent.created_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
-        events = result.scalars().all()
-
+        """Get recent trigger events from in-memory state."""
+        import uuid as _uuid
+        events = self._system_state.get("trigger_events", [])
+        events_page = list(reversed(events))[offset : offset + limit]
         return [
             TriggerEventItem(
-                id=evt.id,
-                trigger_class=evt.trigger_class,
-                trigger_level=evt.trigger_level,
-                market_id=str(evt.market_id) if evt.market_id else None,
-                reason=evt.reason,
-                price=evt.price_at_trigger,
-                spread=evt.spread_at_trigger,
-                data_source=evt.data_source,
-                timestamp=evt.created_at,
+                id=_uuid.UUID(e["id"]),
+                trigger_class=e["trigger_class"],
+                trigger_level=e["trigger_level"],
+                market_id=e.get("market_id"),
+                market_title=e.get("market_title"),
+                reason=e.get("reason"),
+                price=e.get("price"),
+                spread=e.get("spread"),
+                data_source=e.get("data_source", "live"),
+                timestamp=e["timestamp"],
             )
-            for evt in events
+            for e in events_page
         ]
 
     # ─── Cost Metrics ─────────────────────────────────
@@ -449,65 +452,39 @@ class DashboardService:
     # ─── Agent Statuses ───────────────────────────────
 
     async def get_agent_statuses(self) -> list[AgentStatus]:
-        """Get status of all registered agents."""
-        agents = self._system_state.get("agent_statuses", [])
-        if isinstance(agents, list) and agents:
-            return [
-                AgentStatus(**a) if isinstance(a, dict) else a
-                for a in agents
-            ]
-        # Default agent registry
-        default_agents = [
-            AgentStatus(
-                name="Investigator Orchestrator",
-                role="investigator_orchestration",
-                tier="A",
-                is_active=self._system_state.get("agents_running", False),
-            ),
-            AgentStatus(
-                name="Performance Analyzer",
-                role="performance_analyzer",
-                tier="A",
-                is_active=self._system_state.get("agents_running", False),
-            ),
-            AgentStatus(
-                name="Domain Manager (Politics)",
-                role="domain_manager_politics",
-                tier="B",
-                is_active=self._system_state.get("agents_running", False),
-            ),
-            AgentStatus(
-                name="Evidence Research",
-                role="evidence_research",
-                tier="C",
-                is_active=self._system_state.get("agents_running", False),
-            ),
-            AgentStatus(
-                name="Trigger Scanner",
-                role="trigger_scanner",
-                tier="D",
-                is_active=self._system_state.get("agents_running", False),
-            ),
-            AgentStatus(
-                name="Risk Governor",
-                role="risk_governor",
-                tier="D",
-                is_active=self._system_state.get("agents_running", False),
-            ),
-            AgentStatus(
-                name="Cost Governor",
-                role="cost_governor",
-                tier="D",
-                is_active=self._system_state.get("agents_running", False),
-            ),
-            AgentStatus(
-                name="Execution Engine",
-                role="execution_engine",
-                tier="D",
-                is_active=self._system_state.get("agents_running", False),
-            ),
+        """Get status of all registered agents with live invocation/cost data."""
+        is_running = self._system_state.get("agents_running", False)
+        invocations = self._system_state.get("agent_invocations", {})
+        costs = self._system_state.get("agent_costs", {})
+        last_invoked = self._system_state.get("agent_last_invoked", {})
+
+        registry = [
+            ("Investigator Orchestrator", "investigator_orchestration", "A"),
+            ("Performance Analyzer", "performance_analyzer", "A"),
+            ("Domain Manager (Politics)", "domain_manager_politics", "B"),
+            ("Domain Manager (Geopolitics)", "domain_manager_geopolitics", "B"),
+            ("Domain Manager (Technology)", "domain_manager_technology", "B"),
+            ("Evidence Research", "evidence_research", "C"),
+            ("Counter-Case", "counter_case", "C"),
+            ("Resolution Review", "resolution_review", "C"),
+            ("Trigger Scanner", "trigger_scanner", "D"),
+            ("Risk Governor", "risk_governor", "D"),
+            ("Cost Governor", "cost_governor", "D"),
+            ("Execution Engine", "execution_engine", "D"),
         ]
-        return default_agents
+
+        return [
+            AgentStatus(
+                name=name,
+                role=role,
+                tier=tier,
+                is_active=is_running,
+                total_invocations=invocations.get(role, 0),
+                total_cost_usd=costs.get(role, 0.0),
+                last_invoked=last_invoked.get(role),
+            )
+            for name, role, tier in registry
+        ]
 
     # ─── System Control ───────────────────────────────
 

@@ -49,7 +49,8 @@ class ClobClient:
         await self._rate_limiter.acquire()
 
         async def _do_request() -> dict:
-            response = await self._client.get(path, params=params)
+            url = f"{self._config.clob_base_url}{path}"
+            response = await self._client.get(url, params=params)
             response.raise_for_status()
             return response.json()
 

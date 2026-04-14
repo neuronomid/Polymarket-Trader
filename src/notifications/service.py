@@ -125,24 +125,20 @@ class NotificationService:
         try:
             async with self._session_factory() as session:
                 repo = NotificationEventRepository(session)
+                def _to_uuid(val: str | None) -> uuid.UUID | None:
+                    if not val:
+                        return None
+                    try:
+                        return uuid.UUID(val)
+                    except (ValueError, AttributeError):
+                        return None
+
                 event = NotificationEvent(
                     event_type=envelope.event_type.value,
                     severity=envelope.severity.value,
-                    market_id=(
-                        uuid.UUID(envelope.market_id)
-                        if envelope.market_id
-                        else None
-                    ),
-                    position_id=(
-                        uuid.UUID(envelope.position_id)
-                        if envelope.position_id
-                        else None
-                    ),
-                    workflow_run_id=(
-                        uuid.UUID(envelope.workflow_run_id)
-                        if envelope.workflow_run_id
-                        else None
-                    ),
+                    market_id=_to_uuid(envelope.market_id),
+                    position_id=_to_uuid(envelope.position_id),
+                    workflow_run_id=_to_uuid(envelope.workflow_run_id),
                     title=f"{envelope.event_type.value} - {envelope.severity.value}",
                     body=format_notification(envelope),
                     payload=envelope.payload,
