@@ -261,6 +261,11 @@ class DashboardService:
         from data.models.thesis import ThesisCard
         from data.models.workflow import WorkflowRun
 
+        event_time = func.coalesce(
+            WorkflowRun.completed_at,
+            WorkflowRun.started_at,
+            WorkflowRun.created_at,
+        )
         query = (
             select(
                 WorkflowRun,
@@ -270,7 +275,7 @@ class DashboardService:
             .outerjoin(Market, WorkflowRun.market_id == Market.id)
             .outerjoin(ThesisCard, ThesisCard.workflow_run_id == WorkflowRun.id)
             .group_by(WorkflowRun.id, Market.title)
-            .order_by(WorkflowRun.created_at.desc())
+            .order_by(event_time.desc(), WorkflowRun.created_at.desc())
             .limit(limit)
             .offset(offset)
         )
@@ -295,8 +300,16 @@ class DashboardService:
 
         import uuid as _uuid
         runs = self._system_state.get("workflow_runs", [])
-        # Most recent first, then paginate
-        runs_page = list(reversed(runs))[offset : offset + limit]
+        runs_page = sorted(
+            runs,
+            key=lambda run: (
+                run.get("completed_at")
+                or run.get("started_at")
+                or run.get("created_at")
+                or ""
+            ),
+            reverse=True,
+        )[offset : offset + limit]
         return [
             WorkflowRunSummary(
                 id=_uuid.UUID(r["id"]),
@@ -354,7 +367,11 @@ class DashboardService:
 
         import uuid as _uuid
         events = self._system_state.get("trigger_events", [])
-        events_page = list(reversed(events))[offset : offset + limit]
+        events_page = sorted(
+            events,
+            key=lambda event: event.get("timestamp") or "",
+            reverse=True,
+        )[offset : offset + limit]
         return [
             TriggerEventItem(
                 id=_uuid.UUID(e["id"]),

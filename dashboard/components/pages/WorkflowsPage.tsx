@@ -3,7 +3,48 @@
 import { Zap } from "lucide-react";
 import type { WorkflowRunSummary, TriggerEventItem } from "@/lib/api";
 
+const TABLE_EVENT_LIMIT = 10;
+const WORKFLOW_TIME_ZONE = "America/Edmonton";
+
+function parseApiDate(value: string | null): Date | null {
+  if (!value) return null;
+
+  // The dashboard API currently emits UTC datetimes without a timezone suffix.
+  // Treat naive timestamps as UTC so the browser does not interpret them as local time.
+  const normalized = /[zZ]|[+-]\d{2}:\d{2}$/.test(value) ? value : `${value}Z`;
+  const date = new Date(normalized);
+
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function toTimestamp(value: string | null): number {
+  const date = parseApiDate(value);
+  return date ? date.getTime() : 0;
+}
+
+function formatEventTime(value: string | null): string {
+  if (!value) return "—";
+
+  const date = parseApiDate(value);
+  if (!date) return "—";
+
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: WORKFLOW_TIME_ZONE,
+  });
+}
+
 export function WorkflowsPage({ workflows, triggers }: { workflows: WorkflowRunSummary[]; triggers: TriggerEventItem[] }) {
+  const recentWorkflows = [...workflows]
+    .sort((left, right) => toTimestamp(right.completed_at ?? right.started_at) - toTimestamp(left.completed_at ?? left.started_at))
+    .slice(0, TABLE_EVENT_LIMIT);
+
+  const recentTriggers = [...triggers]
+    .sort((left, right) => toTimestamp(right.timestamp) - toTimestamp(left.timestamp))
+    .slice(0, TABLE_EVENT_LIMIT);
+
   return (
     <div>
       <div className="page-header">
@@ -21,14 +62,19 @@ export function WorkflowsPage({ workflows, triggers }: { workflows: WorkflowRunS
             <Zap size={14} color="var(--purple)" />
           </div>
           <table className="data-table">
-            <thead><tr><th>Type</th><th>Status</th><th>Candidates</th><th>Cost</th><th>Duration</th></tr></thead>
+            <thead><tr><th>Time</th><th>Type</th><th>Status</th><th>Candidates</th><th>Cost</th><th>Duration</th></tr></thead>
             <tbody>
-              {workflows.map((wf) => {
+              {recentWorkflows.map((wf) => {
                 const duration = wf.started_at && wf.completed_at
                   ? Math.round((new Date(wf.completed_at).getTime() - new Date(wf.started_at).getTime()) / 1000)
                   : null;
+                const eventTime = wf.completed_at ?? wf.started_at;
+
                 return (
                   <tr key={wf.id}>
+                    <td style={{ color: "var(--text-dim)", fontVariantNumeric: "tabular-nums" }}>
+                      {formatEventTime(eventTime)}
+                    </td>
                     <td style={{ fontWeight: 500 }}>{wf.workflow_type.replace(/_/g, " ")}</td>
                     <td>
                       <span className={`badge ${wf.status === "completed" ? "green" : wf.status === "running" ? "blue" : "red"}`}>
@@ -60,10 +106,13 @@ export function WorkflowsPage({ workflows, triggers }: { workflows: WorkflowRunS
             <Zap size={14} color="var(--yellow)" />
           </div>
           <table className="data-table">
-            <thead><tr><th>Level</th><th>Class</th><th>Market</th><th>Reason</th><th>Source</th></tr></thead>
+            <thead><tr><th>Time</th><th>Level</th><th>Class</th><th>Market</th><th>Reason</th><th>Source</th></tr></thead>
             <tbody>
-              {triggers.map((t) => (
+              {recentTriggers.map((t) => (
                 <tr key={t.id}>
+                  <td style={{ color: "var(--text-dim)", fontVariantNumeric: "tabular-nums" }}>
+                    {formatEventTime(t.timestamp)}
+                  </td>
                   <td>
                     <span className={`badge ${t.trigger_level === "D" ? "red" : t.trigger_level === "C" ? "red" : t.trigger_level === "B" ? "yellow" : "muted"}`}>
                       {t.trigger_level}

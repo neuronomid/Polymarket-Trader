@@ -376,8 +376,8 @@ class TestNetEdgeCalculation:
         edge = NetEdgeCalculation(
             gross_edge=0.05,
             friction_adjusted_edge=0.03,
-            impact_adjusted_edge=0.004,  # below 0.5% threshold
-            net_edge_after_cost=0.002,
+            impact_adjusted_edge=0.001,  # below 0.2% paper-mode threshold
+            net_edge_after_cost=0.0005,
         )
         assert edge.is_viable is False
 
@@ -718,10 +718,11 @@ class TestDomainManagers:
             assert cls is not None, f"No domain manager for {category}"
             assert issubclass(cls, BaseDomainManager)
 
-    def test_unknown_category_returns_none(self):
-        assert get_domain_manager_class("crypto") is None
-        assert get_domain_manager_class("weather") is None
-        assert get_domain_manager_class("") is None
+    def test_unknown_category_falls_back_to_general(self):
+        from investigation.domain_managers import GeneralDomainManager
+        assert get_domain_manager_class("crypto") is GeneralDomainManager
+        assert get_domain_manager_class("weather") is GeneralDomainManager
+        assert get_domain_manager_class("") is GeneralDomainManager
 
     def test_domain_manager_role_names(self):
         assert PoliticsDomainManager.role_name == "domain_manager_politics"
@@ -735,6 +736,7 @@ class TestDomainManagers:
         assert set(DOMAIN_MANAGERS.keys()) == {
             "politics", "geopolitics", "sports",
             "technology", "science_health", "macro_policy",
+            None,
         }
 
     def test_domain_memo_parse_valid_json(self):
@@ -770,7 +772,9 @@ class TestDomainManagers:
             candidate={"category": "politics"},
         )
         assert memo.summary.startswith("Not valid JSON")
-        assert memo.recommended_proceed is False
+        # Invalid JSON fallback defaults to recommended_proceed=True to avoid
+        # silently killing candidates when the LLM returns non-JSON output
+        assert memo.recommended_proceed is True
 
     def test_sports_domain_prompt_contains_quality_gate(self):
         """Sports domain manager adds quality gate instructions."""
@@ -1162,7 +1166,8 @@ class TestInvestigationOrchestrator:
             recommended_proceed=False,
         )
         prob = orchestrator._estimate_probability_from_domain(no_proceed_memo, 0.50)
-        assert prob == 0.50  # No adjustment
+        # Small exploratory offset applied even for no-proceed (Priority 4)
+        assert prob == 0.52
 
     @pytest.mark.asyncio
     async def test_investigation_result_structure(self, mock_router):

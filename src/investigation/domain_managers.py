@@ -93,6 +93,8 @@ class BaseDomainManager(BaseAgent):
             '  "key_findings": [list of key findings],',
             '  "concerns": [list of concerns],',
             '  "recommended_proceed": true/false,',
+            '  "estimated_probability": 0.0-1.0 (your best estimate of the true probability this resolves YES, given your analysis),',
+            '  "probability_direction": "overpriced"|"underpriced"|"fair" (is the current market price too high, too low, or approximately correct),',
             '  "optional_agents": [list of optional agents to invoke, if justified],',
             '  "optional_agents_justification": "reason for optional agents",',
             '  "confidence_level": "low"|"medium"|"high",',
@@ -111,8 +113,36 @@ class BaseDomainManager(BaseAgent):
         try:
             data = json.loads(content)
         except (json.JSONDecodeError, TypeError):
-            # Fallback: create minimal memo from raw response
-            data = {"summary": content[:500], "recommended_proceed": False}
+            # Try extracting JSON from markdown code blocks
+            import re as _re
+            match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, _re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                except (json.JSONDecodeError, TypeError):
+                    data = {}
+            else:
+                data = {}
+            # Non-blocking fallback: allow investigation to continue with low confidence
+            data.setdefault("summary", content[:500])
+            data.setdefault("recommended_proceed", True)
+
+        # Parse and validate estimated_probability
+        raw_prob = data.get("estimated_probability")
+        estimated_prob = None
+        if raw_prob is not None:
+            try:
+                estimated_prob = float(raw_prob)
+                if not (0.0 <= estimated_prob <= 1.0):
+                    estimated_prob = None
+            except (ValueError, TypeError):
+                estimated_prob = None
+
+        # Parse probability_direction
+        raw_direction = data.get("probability_direction")
+        prob_direction = None
+        if raw_direction in ("overpriced", "underpriced", "fair"):
+            prob_direction = raw_direction
 
         return DomainMemo(
             category=candidate.get("category", "unknown"),
@@ -125,6 +155,8 @@ class BaseDomainManager(BaseAgent):
             optional_agents_justification=data.get("optional_agents_justification"),
             confidence_level=data.get("confidence_level", "low"),
             domain_specific_data=data.get("domain_specific_data", {}),
+            estimated_probability=estimated_prob,
+            probability_direction=prob_direction,
         )
 
 
@@ -286,18 +318,51 @@ Focus your analysis on:
         return base + domain_context
 
 
+# --- General (Fallback) Domain Manager ---
+
+
+class GeneralDomainManager(BaseDomainManager):
+    """General-purpose domain manager for markets that don't match a
+    specific category. Uses broad analytical framing."""
+
+    role_name = "domain_manager_general"
+
+    def _build_domain_prompt(
+        self,
+        candidate: dict[str, Any],
+        regime: RegimeContext | None,
+    ) -> str:
+        base = super()._build_domain_prompt(candidate, regime)
+        domain_context = """
+
+DOMAIN: GENERAL
+This market does not fit a specific category. Apply broad analytical reasoning:
+- Identify the core question and what would drive resolution
+- Assess resolution source reliability and objectivity
+- Check for structural biases or information asymmetry
+- Consider base rates for similar types of predictions
+- Evaluate whether public information is already priced in
+- Be explicit about your estimated probability even if uncertain
+"""
+        return base + domain_context
+
+
 # --- Domain Manager Factory ---
 
-DOMAIN_MANAGERS: dict[str, type[BaseDomainManager]] = {
+DOMAIN_MANAGERS: dict[str | None, type[BaseDomainManager]] = {
     "politics": PoliticsDomainManager,
     "geopolitics": GeopoliticsDomainManager,
     "sports": SportsDomainManager,
     "technology": TechnologyDomainManager,
     "science_health": ScienceHealthDomainManager,
     "macro_policy": MacroPolicyDomainManager,
+    None: GeneralDomainManager,
 }
 
 
-def get_domain_manager_class(category: str) -> type[BaseDomainManager] | None:
-    """Get the domain manager class for a given category."""
-    return DOMAIN_MANAGERS.get(category)
+def get_domain_manager_class(category: str | None) -> type[BaseDomainManager] | None:
+    """Get the domain manager class for a given category.
+
+    Falls back to GeneralDomainManager for unknown/unmapped categories.
+    """
+    return DOMAIN_MANAGERS.get(category) or DOMAIN_MANAGERS.get(None)

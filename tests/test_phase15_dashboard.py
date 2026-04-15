@@ -852,6 +852,62 @@ class TestDashboardAPI:
         assert data["api_status"] == "healthy"
         assert data["uptime_pct"] == 100.0
 
+    async def test_paper_balance_deposit_updates_portfolio_equity_immediately(
+        self,
+        client: AsyncClient,
+    ):
+        """Manual paper deposits should sync the portfolio overview immediately."""
+        _system_state.update(
+            {
+                "paper_balance_usd": 500.0,
+                "paper_equity_usd": 500.0,
+                "start_of_day_equity_usd": 500.0,
+                "paper_transactions": [],
+                "equity_history": [],
+            }
+        )
+
+        resp = await client.post(
+            "/api/paper-balance/deposit",
+            json={"amount_usd": 25.0, "reason": "test"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["balance_usd"] == 525.0
+
+        portfolio_resp = await client.get("/api/portfolio")
+        assert portfolio_resp.status_code == 200
+        portfolio = portfolio_resp.json()
+        assert portfolio["total_equity_usd"] == 525.0
+        assert portfolio["equity_history"][-1]["equity_usd"] == 525.0
+
+    async def test_paper_balance_withdraw_updates_portfolio_equity_immediately(
+        self,
+        client: AsyncClient,
+    ):
+        """Manual paper withdrawals should sync the portfolio overview immediately."""
+        _system_state.update(
+            {
+                "paper_balance_usd": 540.0,
+                "paper_equity_usd": 540.0,
+                "start_of_day_equity_usd": 500.0,
+                "paper_transactions": [],
+                "equity_history": [],
+            }
+        )
+
+        resp = await client.post(
+            "/api/paper-balance/withdraw",
+            json={"amount_usd": 15.0, "reason": "test"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["balance_usd"] == 525.0
+
+        portfolio_resp = await client.get("/api/portfolio")
+        assert portfolio_resp.status_code == 200
+        portfolio = portfolio_resp.json()
+        assert portfolio["total_equity_usd"] == 525.0
+        assert portfolio["equity_history"][-1]["equity_usd"] == 525.0
+
     async def test_calibration_endpoint(self, client: AsyncClient):
         """Calibration endpoint returns CalibrationOverview."""
         resp = await client.get("/api/calibration")
@@ -1170,6 +1226,51 @@ class TestWorkflowAndTriggerDB:
         assert run.workflow_type == "scheduled_sweep"
         assert run.status == "completed"
         assert run.cost_usd == 1.25
+
+    async def test_get_workflow_runs_orders_by_latest_event_time(
+        self, session: AsyncSession
+    ):
+        """Workflow runs are ordered by the latest event timestamp, not insertion time."""
+        market = Market(
+            market_id="workflow-ordering-market",
+            title="Workflow Ordering Market",
+            description="Dashboard ordering test",
+            category="politics",
+            market_status="active",
+            is_active=True,
+            slug="workflow-ordering-market",
+        )
+        session.add(market)
+        await session.flush()
+
+        older_created_later_completed = WorkflowRun(
+            workflow_run_id=f"wf-order-old-{uuid.uuid4().hex[:8]}",
+            run_type="trigger_based",
+            market_id=market.id,
+            status="completed",
+            created_at=datetime(2026, 4, 15, 4, 0, tzinfo=UTC),
+            started_at=datetime(2026, 4, 15, 4, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 15, 6, 16, tzinfo=UTC),
+        )
+        newer_created_earlier_completed = WorkflowRun(
+            workflow_run_id=f"wf-order-new-{uuid.uuid4().hex[:8]}",
+            run_type="scheduled_sweep",
+            market_id=market.id,
+            status="completed",
+            created_at=datetime(2026, 4, 15, 5, 30, tzinfo=UTC),
+            started_at=datetime(2026, 4, 15, 5, 30, tzinfo=UTC),
+            completed_at=datetime(2026, 4, 15, 5, 45, tzinfo=UTC),
+        )
+        session.add_all([older_created_later_completed, newer_created_earlier_completed])
+        await session.flush()
+
+        service = DashboardService(session=session)
+        runs = await service.get_workflow_runs(limit=2)
+
+        assert [run.id for run in runs] == [
+            older_created_later_completed.id,
+            newer_created_earlier_completed.id,
+        ]
 
     async def test_trigger_events_empty(self, session: AsyncSession):
         """Empty trigger events list."""

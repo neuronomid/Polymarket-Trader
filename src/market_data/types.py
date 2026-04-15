@@ -110,6 +110,10 @@ class MarketInfo(BaseModel):
     liquidity: float | None = None
     spread: float | None = None
     resolution_source: str | None = None
+    # Price fields — populated from Gamma API when available (bestBid/bestAsk/lastTradePrice).
+    # Avoids AttributeError if anything accesses market.price on a MarketInfo object.
+    price: float | None = None
+    mid_price: float | None = None
 
     @classmethod
     def from_gamma_response(cls, data: dict) -> MarketInfo:
@@ -155,6 +159,8 @@ class MarketInfo(BaseModel):
             liquidity=_safe_float(data.get("liquidityNum")),
             spread=_safe_float(data.get("spread")),
             resolution_source=data.get("resolutionSource") or None,
+            price=_safe_float(data.get("lastTradePrice") or data.get("price")),
+            mid_price=_safe_float(data.get("midPrice") or data.get("mid_price")),
         )
 
 

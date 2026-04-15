@@ -111,6 +111,7 @@ _system_state: dict[str, Any] = {
     "active_alerts_count": 0,
     # Paper balance tracking
     "paper_balance_usd": _persisted.get("paper_balance_usd", 500.0),
+    "paper_equity_usd": _persisted.get("paper_balance_usd", 500.0),
     "start_of_day_equity_usd": _persisted.get("start_of_day_equity_usd", 500.0),
     "paper_transactions": [],
     # Activity log (circular buffer, last 200 events)
@@ -518,7 +519,7 @@ def create_dashboard_app() -> FastAPI:
         if mode not in ("shadow", "paper"):
             raise HTTPException(status_code=400, detail="Can only deposit in shadow/paper mode")
 
-        _system_state["paper_balance_usd"] = _system_state.get("paper_balance_usd", 500.0) + request.amount_usd
+        _update_paper_account_state(request.amount_usd)
         txn = {
             "type": "deposit",
             "amount_usd": request.amount_usd,
@@ -555,7 +556,7 @@ def create_dashboard_app() -> FastAPI:
         if request.amount_usd > current:
             raise HTTPException(status_code=400, detail=f"Insufficient balance: ${current:.2f}")
 
-        _system_state["paper_balance_usd"] = current - request.amount_usd
+        _update_paper_account_state(-request.amount_usd)
         txn = {
             "type": "withdraw",
             "amount_usd": request.amount_usd,
@@ -619,6 +620,24 @@ def _add_activity(
     # Keep only last 200 entries
     if len(log) > 200:
         _system_state["activity_log"] = log[-200:]
+
+
+def _update_paper_account_state(delta_usd: float) -> None:
+    """Apply a manual paper balance change and keep equity views in sync."""
+    current_balance = float(_system_state.get("paper_balance_usd", 500.0))
+    current_equity = float(_system_state.get("paper_equity_usd", current_balance))
+    start_of_day = float(_system_state.get("start_of_day_equity_usd", current_balance))
+
+    new_balance = round(current_balance + delta_usd, 2)
+    new_equity = round(current_equity + delta_usd, 2)
+
+    _system_state["paper_balance_usd"] = new_balance
+    _system_state["paper_equity_usd"] = new_equity
+
+    _add_equity_snapshot(
+        equity_usd=new_equity,
+        pnl_usd=round(new_equity - start_of_day, 2),
+    )
 
 
 def _add_trigger_event(

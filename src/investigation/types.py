@@ -222,6 +222,8 @@ class DomainMemo(BaseModel):
     optional_agents_justification: str | None = None
     confidence_level: str = "low"  # low, medium, high
     domain_specific_data: dict[str, Any] = Field(default_factory=dict)
+    estimated_probability: float | None = None  # LLM's estimate of P(YES), 0.0-1.0
+    probability_direction: str | None = None  # "overpriced" | "underpriced" | "fair"
 
 
 # --- Research Pack Results ---
@@ -314,7 +316,8 @@ class NetEdgeCalculation(BaseModel):
     @property
     def is_viable(self) -> bool:
         """Whether the net edge is positive enough to trade."""
-        return self.impact_adjusted_edge > 0.005  # 0.5% minimum
+        # PAPER_MODE_RELAXATION: 0.2% for calibration learning. Tighten to 0.5%+ for live.
+        return self.impact_adjusted_edge > 0.002
 
     @property
     def is_cost_efficient(self) -> bool:

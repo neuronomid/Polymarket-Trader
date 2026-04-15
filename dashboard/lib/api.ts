@@ -449,11 +449,11 @@ export async function fetchCategories(): Promise<CategoryPerformanceEntry[]> {
 }
 
 export async function fetchWorkflows(): Promise<WorkflowRunSummary[]> {
-  return liveOrMock("/api/workflows", []);
+  return liveOrMock("/api/workflows?limit=50", []);
 }
 
 export async function fetchTriggers(): Promise<TriggerEventItem[]> {
-  return liveOrMock("/api/triggers", []);
+  return liveOrMock("/api/triggers?limit=100", []);
 }
 
 export async function fetchAgents(): Promise<AgentStatus[]> {
@@ -500,7 +500,7 @@ export async function withdrawPaperFunds(amount: number, reason?: string): Promi
 // Activity Log
 // ──────────────────────────────────────────────
 
-export async function fetchActivityLog(limit = 50): Promise<ActivityLogEntry[]> {
+export async function fetchActivityLog(limit = 40): Promise<ActivityLogEntry[]> {
   return liveOrMock(`/api/activity?limit=${limit}`, []);
 }
 

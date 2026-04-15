@@ -95,8 +95,9 @@ async def main() -> None:
             message="System is live. Press Ctrl+C to shut down.",
         )
 
-        # Optionally start the dashboard API in a background task
+        # Start the dashboard API in a background task; failures are logged, not fatal
         dashboard_task = asyncio.create_task(_start_dashboard_api(config, log))
+        dashboard_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
         # Wait for shutdown signal
         await shutdown_event.wait()
@@ -131,6 +132,9 @@ async def _start_dashboard_api(config, log) -> None:
         await server.serve()
     except ImportError:
         log.warning("uvicorn_not_installed", message="Dashboard API not started. Install uvicorn.")
+    except SystemExit as exc:
+        # uvicorn calls sys.exit(1) on bind failure (e.g. port already in use)
+        log.error("dashboard_api_failed_to_start", error=str(exc), hint="Port 8000 may already be in use")
     except Exception as exc:
         log.error("dashboard_api_error", error=str(exc))
 

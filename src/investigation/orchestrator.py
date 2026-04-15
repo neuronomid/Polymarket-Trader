@@ -291,13 +291,40 @@ class InvestigationOrchestrator:
         )
         agent_costs[domain_role] = agent_costs.get(domain_role, 0.0) + domain_cost
 
-        if domain_memo is None or not domain_memo.recommended_proceed:
+        if domain_memo is None:
             _log.info(
-                "candidate_rejected_by_domain_manager",
+                "candidate_rejected_no_domain_memo",
                 market_id=candidate.market_id,
-                reason="Domain manager did not recommend proceeding",
+                category=candidate.category,
             )
             return None
+
+        if not domain_memo.recommended_proceed:
+            # If the LLM provided a probability estimate or direction, allow
+            # investigation to continue — downstream checks (rubric, net edge,
+            # risk governor) will still filter bad candidates.
+            has_signal = (
+                domain_memo.estimated_probability is not None
+                or domain_memo.probability_direction is not None
+            )
+            if not has_signal:
+                _log.info(
+                    "candidate_rejected_no_proceed_no_signal",
+                    market_id=candidate.market_id,
+                    title=candidate.title[:60] if candidate.title else "",
+                    category=candidate.category,
+                    confidence_level=domain_memo.confidence_level,
+                    concerns=domain_memo.concerns[:3] if domain_memo.concerns else [],
+                    summary=domain_memo.summary[:120] if domain_memo.summary else "",
+                )
+                return None
+            _log.info(
+                "domain_no_proceed_but_has_signal_continuing",
+                market_id=candidate.market_id,
+                estimated_prob=domain_memo.estimated_probability,
+                direction=domain_memo.probability_direction,
+                confidence=domain_memo.confidence_level,
+            )
 
         # --- Step 5: Run research pack (5 default agents) ---
         research = await self._run_research_pack(
@@ -351,13 +378,24 @@ class InvestigationOrchestrator:
         )
 
         # --- Step 10: Check rubric threshold ---
+        _log.info(
+            "candidate_rubric_detail",
+            market_id=candidate.market_id,
+            title=candidate.title[:60] if candidate.title else "",
+            composite_score=rubric_score.composite_score,
+            threshold=MIN_COMPOSITE_FOR_ACCEPTANCE,
+            passes=rubric_score.composite_score >= MIN_COMPOSITE_FOR_ACCEPTANCE,
+            gross_edge=round(gross_edge, 4),
+            evidence_quality=rubric_score.evidence_quality,
+            resolution_clarity=rubric_score.resolution_clarity,
+            market_structure=rubric_score.market_structure_quality,
+            timing_clarity=rubric_score.timing_clarity,
+            ambiguity_level=rubric_score.ambiguity_level,
+            counter_case_strength=rubric_score.counter_case_strength,
+            domain_confidence=domain_memo.confidence_level,
+            domain_proceed=domain_memo.recommended_proceed,
+        )
         if rubric_score.composite_score < MIN_COMPOSITE_FOR_ACCEPTANCE:
-            _log.info(
-                "candidate_rejected_by_rubric",
-                market_id=candidate.market_id,
-                composite_score=rubric_score.composite_score,
-                threshold=MIN_COMPOSITE_FOR_ACCEPTANCE,
-            )
             return None
 
         # --- Step 11: Compute net edge (Tier D) ---
@@ -839,19 +877,36 @@ class InvestigationOrchestrator:
         domain_memo: DomainMemo,
         market_implied: float,
     ) -> float:
-        """Derive a preliminary probability estimate from domain memo.
+        """Derive a probability estimate from domain memo.
 
-        In the full system, this would use the orchestrator's output.
-        For the initial pipeline, we use a simple heuristic.
+        Priority chain:
+        1. Direct LLM probability estimate (best signal)
+        2. Direction-aware confidence adjustment
+        3. Legacy fallback for recommended_proceed=True
+        4. Small exploratory offset when no strong signal
         """
-        confidence_map = {"high": 0.15, "medium": 0.08, "low": 0.03}
-        adjustment = confidence_map.get(domain_memo.confidence_level, 0.03)
+        # Priority 1: Direct LLM probability estimate
+        if (
+            domain_memo.estimated_probability is not None
+            and 0.05 <= domain_memo.estimated_probability <= 0.95
+        ):
+            return domain_memo.estimated_probability
 
-        # If domain manager recommends proceeding, assume slight mispricing
+        # Priority 2: Direction-aware confidence adjustment
+        confidence_map = {"high": 0.15, "medium": 0.08, "low": 0.04}
+        adjustment = confidence_map.get(domain_memo.confidence_level, 0.04)
+
+        if domain_memo.probability_direction == "overpriced":
+            return max(0.05, market_implied - adjustment)
+        elif domain_memo.probability_direction == "underpriced":
+            return min(0.95, market_implied + adjustment)
+
+        # Priority 3: Legacy fallback (proceed=True, no direction info)
         if domain_memo.recommended_proceed:
-            # We don't know the direction yet, so use a small offset
             return min(0.95, max(0.05, market_implied + adjustment))
-        return market_implied
+
+        # Priority 4: Small exploratory offset so downstream checks can evaluate
+        return min(0.95, max(0.05, market_implied + 0.02))
 
 
 class _OrchestratorAgent(BaseAgent):

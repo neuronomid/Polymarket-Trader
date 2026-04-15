@@ -5,16 +5,32 @@ import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell,
 } from "recharts";
+import type { TooltipContentProps, TooltipValueType } from "recharts";
 import {
   TrendingUp, DollarSign, Target, Shield, Activity,
-  Zap, Eye, ArrowUpRight, ArrowDownRight,
+  Zap, ArrowUpRight, ArrowDownRight,
   Radio, AlertTriangle, CheckCircle, XCircle, Info,
 } from "lucide-react";
 import type { DashboardData } from "@/app/page";
 
 const CHART_COLORS = ["#01796f", "#0ea5e9", "#8b5cf6", "#f59e0b", "#f97316", "#f43f5e"];
 
-const CustomTooltip = ({ active, payload, label }: any) => {
+function formatTooltipValue(value: TooltipValueType | undefined): string {
+  if (Array.isArray(value)) return value.join(", ");
+
+  const numericValue = Number(value);
+  if (!Number.isNaN(numericValue)) {
+    return numericValue.toLocaleString(undefined, { minimumFractionDigits: 2 });
+  }
+
+  return String(value ?? "");
+}
+
+const CustomTooltip = ({
+  active,
+  payload,
+  label,
+}: TooltipContentProps<TooltipValueType, string>) => {
   if (!active || !payload?.length) return null;
   return (
     <div style={{
@@ -25,9 +41,9 @@ const CustomTooltip = ({ active, payload, label }: any) => {
       <div style={{ color: "var(--text-dim)", marginBottom: "0.25rem" }}>
         {new Date(label).toLocaleDateString()}
       </div>
-      {payload.map((p: any, i: number) => (
-        <div key={i} style={{ color: p.color, fontWeight: 600 }}>
-          ${p.value.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+      {payload.map((entry, i: number) => (
+        <div key={i} style={{ color: entry.color, fontWeight: 600 }}>
+          ${formatTooltipValue(entry.value)}
         </div>
       ))}
     </div>
@@ -72,6 +88,8 @@ function timeAgo(timestamp: string): string {
 export function OverviewPage({ data }: { data: DashboardData }) {
   const p = data.portfolio;
   const [timeframe, setTimeframe] = useState<"D" | "W" | "M" | "All">("D");
+
+  const recentActivity = useMemo(() => data.activityLog.slice(0, 40), [data.activityLog]);
 
   const equityData = useMemo(() => {
     if (!p) return [];
@@ -251,7 +269,7 @@ export function OverviewPage({ data }: { data: DashboardData }) {
             <Activity size={14} color="var(--neon)" />
           </div>
           <div style={{ maxHeight: 380, overflowY: "auto" }}>
-            {data.activityLog.length === 0 ? (
+            {recentActivity.length === 0 ? (
               <div style={{ padding: "2rem", textAlign: "center", color: "var(--text-dim)" }}>
                 <Radio size={20} style={{ marginBottom: "0.5rem", opacity: 0.5 }} />
                 <div style={{ fontSize: "0.8rem" }}>Waiting for system activity…</div>
@@ -260,7 +278,7 @@ export function OverviewPage({ data }: { data: DashboardData }) {
                 </div>
               </div>
             ) : (
-              data.activityLog.map((entry) => (
+              recentActivity.map((entry) => (
                 <div key={entry.id} style={{
                   display: "flex", alignItems: "flex-start", gap: "0.6rem",
                   padding: "0.5rem 0", borderBottom: "1px solid rgba(255,255,255,0.03)",
