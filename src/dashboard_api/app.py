@@ -40,6 +40,7 @@ from dashboard_api.schemas import (
     SystemHealthOverview,
     TriggerEventItem,
     ViabilityOverview,
+    WorkflowRunDetail,
     WorkflowRunSummary,
 )
 from dashboard_api.services import DashboardService
@@ -286,6 +287,21 @@ def create_dashboard_app() -> FastAPI:
     ):
         """Recent workflow runs."""
         return await service.get_workflow_runs(limit=limit, offset=offset)
+
+    @app.get(
+        "/api/workflows/{workflow_id}",
+        response_model=WorkflowRunDetail,
+        tags=["workflows"],
+    )
+    async def get_workflow_detail(
+        workflow_id: uuid.UUID,
+        service: DashboardService = Depends(get_dashboard_service),
+    ):
+        """Detailed workflow diagnostics including candidate outcomes."""
+        detail = await service.get_workflow_run_detail(workflow_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return detail
 
     # ─── Triggers ─────────────────────────────────
 

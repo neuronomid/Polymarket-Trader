@@ -41,6 +41,18 @@ _TITLE_GEOPOLITICS_PATTERNS: list[re.Pattern[str]] = [
 _TITLE_SPORTS_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r'\b(?:ipl|indian\s+premier\s+league)\b', re.IGNORECASE),
     re.compile(r'\b(?:nba|nfl|mlb|nhl|ufc|mma)\s+(?:playoffs?|finals?|championship)\b', re.IGNORECASE),
+    re.compile(
+        r'\b(?:vs\.?|versus)\b.*\b(?:win|beat|defeat|draw|match|game|series|innings|final)\b',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\b(?:match|game|series)\b.*\b(?:draw|win|winner)\b',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\b(?:end|ends)\s+in\s+a\s+draw\b',
+        re.IGNORECASE,
+    ),
 ]
 
 _EXCLUDED_KEYWORDS: dict[str, ExcludedCategory] = {

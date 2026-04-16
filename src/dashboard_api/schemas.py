@@ -26,10 +26,22 @@ class EquitySnapshot(BaseModel):
     pnl_usd: float
 
 
+class RejectionBreakdownItem(BaseModel):
+    """Compact rejection summary for empty-state diagnostics."""
+
+    reason_code: str
+    stage: str | None = None
+    count: int = 0
+    latest_market_title: str | None = None
+    latest_reason: str | None = None
+
+
 class PortfolioOverview(BaseModel):
     """Executive-level portfolio summary."""
 
     total_equity_usd: float = 0.0
+    paper_cash_balance_usd: float = 0.0
+    paper_equity_usd: float = 0.0
     total_open_exposure_usd: float = 0.0
     daily_pnl_usd: float = 0.0
     unrealized_pnl_usd: float = 0.0
@@ -38,7 +50,10 @@ class PortfolioOverview(BaseModel):
     drawdown_level: str = "normal"
     drawdown_pct: float = 0.0
     operator_mode: str = "paper"
+    mode_capability_status: str = "paper"
+    mode_capability_detail: str = "Autonomous simulated trading enabled."
     system_status: str = "running"  # running | stopped | degraded
+    latest_rejection_breakdown: list[RejectionBreakdownItem] = Field(default_factory=list)
     equity_history: list[EquitySnapshot] = Field(default_factory=list)
 
 
@@ -134,10 +149,76 @@ class WorkflowRunSummary(BaseModel):
     status: str
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    estimated_cost_usd: float = 0.0
     cost_usd: float = 0.0
     candidates_reviewed: int = 0
     candidates_accepted: int = 0
     market_title: str | None = None
+    outcome: str | None = None
+    outcome_reason: str | None = None
+    operator_mode: str | None = None
+    final_stage: str | None = None
+
+
+class WorkflowCostEstimateDetail(BaseModel):
+    """Persisted pre-run cost estimate for a workflow."""
+
+    expected_cost_min_usd: float
+    expected_cost_max_usd: float
+    daily_budget_remaining_usd: float
+    lifetime_budget_remaining_usd: float
+    daily_budget_pct_remaining: float
+    estimated_at: datetime
+    agent_budgets: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowCostDecisionDetail(BaseModel):
+    """Persisted Cost Governor decision for a workflow."""
+
+    decision: str
+    reason: str
+    approved_max_tier: str | None = None
+    approved_max_cost_usd: float | None = None
+    cost_selectivity_ratio: float | None = None
+    opus_escalation_threshold: float | None = None
+    decided_at: datetime
+
+
+class WorkflowEstimateAccuracyDetail(BaseModel):
+    """Estimate-vs-actual accuracy for a workflow."""
+
+    estimated_min_usd: float
+    estimated_max_usd: float
+    actual_usd: float
+    accuracy_ratio: float
+    within_bounds: bool
+
+
+class WorkflowCandidateDetail(BaseModel):
+    """Candidate-level workflow outcome with stage diagnostics."""
+
+    market_id: str
+    market_title: str | None = None
+    category: str | None = None
+    accepted: bool = False
+    stage_reached: str | None = None
+    reason: str | None = None
+    reason_code: str | None = None
+    reason_detail: str | None = None
+    cost_spent_usd: float = 0.0
+    quantitative_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowRunDetail(WorkflowRunSummary):
+    """Detailed workflow inspection payload."""
+
+    workflow_run_id: str
+    models_used: list[str] = Field(default_factory=list)
+    max_tier_used: str | None = None
+    cost_estimate: WorkflowCostEstimateDetail | None = None
+    cost_decision: WorkflowCostDecisionDetail | None = None
+    estimate_accuracy: WorkflowEstimateAccuracyDetail | None = None
+    candidate_outcomes: list[WorkflowCandidateDetail] = Field(default_factory=list)
 
 
 # ──────────────────────────────────────────────
@@ -430,4 +511,3 @@ class ActivityLogEntry(BaseModel):
     message: str
     detail: str | None = None
     severity: str = "info"  # info, warning, error, success
-

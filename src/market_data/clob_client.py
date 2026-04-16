@@ -70,14 +70,19 @@ class ClobClient:
             max_levels=self._config.orderbook_depth_levels,
         )
 
-    async def fetch_price(self, token_id: str) -> float | None:
-        """Fetch midpoint price for a token."""
+    async def fetch_price(self, token_id: str, *, side: str = "BUY") -> float | None:
+        """Fetch best price for a token.
+
+        The /price endpoint requires a side parameter (BUY or SELL).
+        Defaults to BUY (best ask) as a proxy for the current market price.
+        Prefer fetch_midpoint() for a neutral price reference.
+        """
         try:
-            data = await self._request("/price", params={"token_id": token_id})
+            data = await self._request("/price", params={"token_id": token_id, "side": side})
             price = data.get("price")
             return float(price) if price is not None else None
         except Exception:
-            self._log.warning("price_fetch_failed", token_id=token_id)
+            self._log.warning("price_fetch_failed", token_id=token_id, side=side)
             return None
 
     async def fetch_last_trade(
@@ -106,13 +111,45 @@ class ClobClient:
             self._log.warning("last_trade_fetch_failed", token_id=token_id)
             return None, None
 
+    async def fetch_midpoint(self, token_id: str) -> float | None:
+        """Fetch actual midpoint price from the /midpoint endpoint.
+
+        More reliable than computing from the order book when sentinel orders
+        (floor at 0.001, ceiling at 0.999) dominate the book.
+        """
+        try:
+            data = await self._request("/midpoint", params={"token_id": token_id})
+            mid = data.get("mid")
+            return float(mid) if mid is not None else None
+        except Exception:
+            self._log.warning("midpoint_fetch_failed", token_id=token_id)
+            return None
+
     async def fetch_market_snapshot(self, token_id: str) -> MarketSnapshot:
         """Fetch a complete market snapshot: order book + last trade.
 
         Combines order book data with last trade info into a single snapshot.
+        When the order book is dominated by sentinel orders (spread > 0.5), the
+        book mid_price is meaningless (~0.5). In that case, fetch the actual
+        midpoint from /midpoint and use it as the price reference instead.
         """
         book = await self.fetch_order_book(token_id)
         last_trade_price, last_trade_time = await self.fetch_last_trade(token_id)
+
+        # Sentinel orders produce a spread of ~0.98 and a mid_price of ~0.5,
+        # which is useless for tracking real price moves. Use /midpoint instead.
+        actual_mid = book.mid_price
+        if book.spread is not None and book.spread > 0.5:
+            midpoint = await self.fetch_midpoint(token_id)
+            if midpoint is not None:
+                actual_mid = midpoint
+                self._log.debug(
+                    "midpoint_override",
+                    token_id=token_id,
+                    book_mid=book.mid_price,
+                    actual_mid=actual_mid,
+                    book_spread=book.spread,
+                )
 
         depth_levels_data: dict | None = None
         if book.bids or book.asks:
@@ -123,11 +160,11 @@ class ClobClient:
 
         return MarketSnapshot(
             token_id=token_id,
-            price=book.mid_price,
+            price=actual_mid,
             best_bid=book.best_bid,
             best_ask=book.best_ask,
             spread=book.spread,
-            mid_price=book.mid_price,
+            mid_price=actual_mid,
             last_trade_price=last_trade_price,
             last_trade_time=last_trade_time,
             depth_levels=depth_levels_data,

@@ -348,7 +348,20 @@ class TriggerScanner:
             return
 
         snapshot = data.snapshot
-        entry.last_price = snapshot.mid_price or snapshot.price
+
+        # Prefer mid_price from the snapshot (already corrected via /midpoint when
+        # the order book had sentinel orders). Fall back to last_trade_price when
+        # mid_price is still dominated by sentinel orders (spread > 0.5 → mid ≈ 0.5),
+        # then to snapshot.price as a last resort.
+        if snapshot.mid_price is not None and (
+            snapshot.spread is None or snapshot.spread <= 0.5
+        ):
+            entry.last_price = snapshot.mid_price
+        elif snapshot.last_trade_price is not None:
+            entry.last_price = snapshot.last_trade_price
+        else:
+            entry.last_price = snapshot.price
+
         entry.last_spread = snapshot.spread
         entry.last_scanned_at = datetime.now(tz=UTC)
 

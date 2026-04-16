@@ -222,6 +222,17 @@ class TestTriggerDetectorPriceMove:
         assert price_triggers[0].previous_value == 0.50
         assert price_triggers[0].current_value == 0.56
 
+    def test_extreme_probability_repricing_is_ignored_for_unheld_market(
+        self,
+        detector: TriggerDetector,
+    ):
+        """Tiny longshot repricings should not surface as entry signals."""
+        entry = _make_watch_entry(last_price=0.0075, is_held_position=False)
+        data = _make_cached_data(mid_price=0.0085)
+        triggers = detector.detect_triggers(entry, data)
+        price_triggers = [t for t in triggers if t.trigger_class == TriggerClass.REPRICING]
+        assert price_triggers == []
+
 
 # ============================================================================
 # TriggerDetector: Spread Tests
@@ -348,6 +359,29 @@ class TestTriggerDetectorDepth:
             and t.depth_snapshot is not None
         ]
         assert len(depth_triggers) == 0
+
+    def test_extreme_probability_depth_change_is_ignored_for_unheld_market(
+        self,
+        detector: TriggerDetector,
+    ):
+        """Longshot depth shocks should not surface as entry opportunities."""
+        entry = _make_watch_entry(
+            last_price=0.0015,
+            last_depth_top3=500000.0,
+            is_held_position=False,
+        )
+        depth = {
+            "bids": [{"price": 0.0010, "size": 50000}],
+            "asks": [{"price": 0.0020, "size": 65000}],
+        }
+        data = _make_cached_data(mid_price=0.0010, depth_levels=depth)
+        triggers = detector.detect_triggers(entry, data)
+        depth_triggers = [
+            t for t in triggers
+            if t.trigger_class == TriggerClass.LIQUIDITY
+            and t.depth_snapshot is not None
+        ]
+        assert depth_triggers == []
 
 
 # ============================================================================

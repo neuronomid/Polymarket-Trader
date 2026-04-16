@@ -54,10 +54,13 @@ class PipelineResult(BaseModel):
     stage_reached: PipelineStage
     accepted: bool = False
     reason: str = ""
+    reason_code: str = ""
+    reason_detail: str | None = None
     thesis_card_id: str | None = None
     execution_id: str | None = None
     total_cost_usd: float = 0.0
     duration_seconds: float = 0.0
+    quantitative_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class SystemState(BaseModel):

@@ -335,7 +335,8 @@ class AbsenceManager:
             interaction_type=InteractionType.ALERT_ACKNOWLEDGMENT,
             details={"event": "return_acknowledged"},
         )
-        state = self.record_interaction(interaction)
+        self._last_interaction = interaction
+        state = self.compute_state(now=interaction.interacted_at)
 
         _log.info(
             "operator_return_acknowledged",

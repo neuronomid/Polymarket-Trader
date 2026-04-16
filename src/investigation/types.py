@@ -19,6 +19,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from cost.types import CostApproval, CostEstimate, EstimateAccuracy
 
 # --- Enums ---
 
@@ -297,6 +298,10 @@ class CandidateContext(BaseModel):
     # Priority
     urgency_rank: int = 0
 
+    # Metadata hydration quality
+    metadata_status: str = "complete"  # complete, unknown_category, metadata_incomplete
+    metadata_issues: list[str] = Field(default_factory=list)
+
 
 # --- Net Edge Calculation ---
 
@@ -312,12 +317,12 @@ class NetEdgeCalculation(BaseModel):
     friction_adjusted_edge: float = 0.0  # after spread and slippage
     impact_adjusted_edge: float = 0.0  # after entry impact estimate
     net_edge_after_cost: float = 0.0  # the number the system acts on
+    min_viable_edge: float = 0.002
 
     @property
     def is_viable(self) -> bool:
         """Whether the net edge is positive enough to trade."""
-        # PAPER_MODE_RELAXATION: 0.2% for calibration learning. Tighten to 0.5%+ for live.
-        return self.impact_adjusted_edge > 0.002
+        return self.impact_adjusted_edge > self.min_viable_edge
 
     @property
     def is_cost_efficient(self) -> bool:
@@ -424,12 +429,33 @@ class NoTradeResult(BaseModel):
     """
 
     market_id: str | None = None
+    market_title: str | None = None
+    category: str | None = None
     reason: str = ""
     reason_code: str = ""
     stage: str = ""  # which stage rejected
+    reason_detail: str | None = None
+    quantitative_context: dict[str, Any] = Field(default_factory=dict)
     rubric_score: CandidateRubricScore | None = None
     cost_spent_usd: float = 0.0
     decided_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+
+
+class CandidateInvestigationResult(BaseModel):
+    """Outcome for a single investigated candidate."""
+
+    market_id: str
+    market_title: str = ""
+    category: str = "unknown"
+    accepted: bool = False
+    stage_reached: str = ""
+    reason: str = ""
+    reason_code: str = ""
+    reason_detail: str | None = None
+    quantitative_context: dict[str, Any] = Field(default_factory=dict)
+    cost_spent_usd: float = 0.0
+    thesis_card: ThesisCardData | None = None
+    no_trade_result: NoTradeResult | None = None
 
 
 # --- Investigation Request ---
@@ -461,11 +487,15 @@ class InvestigationResult(BaseModel):
 
     # No-trade records
     no_trade_results: list[NoTradeResult] = Field(default_factory=list)
+    candidate_outcomes: list[CandidateInvestigationResult] = Field(default_factory=list)
 
     # Cost tracking
     estimated_cost_usd: float = 0.0
     actual_cost_usd: float = 0.0
     agent_costs: dict[str, float] = Field(default_factory=dict)
+    cost_estimate: CostEstimate | None = None
+    cost_approval: CostApproval | None = None
+    estimate_accuracy: EstimateAccuracy | None = None
 
     # Metadata
     candidates_evaluated: int = 0

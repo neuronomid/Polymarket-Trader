@@ -31,6 +31,7 @@ from dashboard_api.schemas import (
     PortfolioOverview,
     PositionDetail,
     PositionSummary,
+    RejectionBreakdownItem,
     RiskBoard,
     ScannerHealth,
     SystemControlResponse,
@@ -39,6 +40,11 @@ from dashboard_api.schemas import (
     TriggerEventItem,
     ViabilityCheckpointItem,
     ViabilityOverview,
+    WorkflowCandidateDetail,
+    WorkflowCostDecisionDetail,
+    WorkflowCostEstimateDetail,
+    WorkflowEstimateAccuracyDetail,
+    WorkflowRunDetail,
     WorkflowRunSummary,
 )
 
@@ -94,11 +100,36 @@ class DashboardService:
             for snap in raw_history
         ]
 
-        return PortfolioOverview(
-            total_equity_usd=self._system_state.get(
-                "paper_equity_usd",
-                self._system_state.get("paper_balance_usd", 500.0),
+        operator_mode = self._system_state.get("operator_mode", "paper")
+        paper_cash = float(self._system_state.get("paper_balance_usd", 500.0))
+        paper_equity = float(self._system_state.get("paper_equity_usd", paper_cash))
+        rejection_breakdown: list[RejectionBreakdownItem] = []
+        if int(row.count) == 0 and operator_mode == "paper":
+            rejection_breakdown = await self._get_latest_rejection_breakdown()
+
+        capability_map = {
+            "paper": (
+                "paper",
+                "Autonomous simulated trading enabled.",
             ),
+            "shadow": (
+                "shadow",
+                "Non-executing log-only mode.",
+            ),
+            "live": (
+                "live",
+                "Execution unavailable until the exchange adapter is implemented.",
+            ),
+        }
+        capability_status, capability_detail = capability_map.get(
+            operator_mode,
+            ("unknown", "Mode capability is unknown."),
+        )
+
+        return PortfolioOverview(
+            total_equity_usd=paper_equity,
+            paper_cash_balance_usd=paper_cash,
+            paper_equity_usd=paper_equity,
             total_open_exposure_usd=float(row.exposure),
             daily_pnl_usd=float(row.unrealized) + float(row.realized),
             unrealized_pnl_usd=float(row.unrealized),
@@ -106,10 +137,43 @@ class DashboardService:
             open_positions_count=int(row.count),
             drawdown_level=self._system_state.get("drawdown_level", "normal"),
             drawdown_pct=self._system_state.get("drawdown_pct", 0.0),
-            operator_mode=self._system_state.get("operator_mode", "paper"),
+            operator_mode=operator_mode,
+            mode_capability_status=capability_status,
+            mode_capability_detail=capability_detail,
             system_status=self._system_state.get("system_status", "running"),
+            latest_rejection_breakdown=rejection_breakdown,
             equity_history=equity_history,
         )
+
+    async def _get_latest_rejection_breakdown(self) -> list[RejectionBreakdownItem]:
+        """Summarize recent candidate rejection logs for empty portfolio states."""
+        from data.models.logging import StructuredLogEntry
+
+        result = await self._session.execute(
+            select(StructuredLogEntry)
+            .where(StructuredLogEntry.event_type == "candidate_rejected")
+            .order_by(StructuredLogEntry.logged_at.desc())
+            .limit(20)
+        )
+        entries = result.scalars().all()
+        grouped: dict[tuple[str, str | None], RejectionBreakdownItem] = {}
+        for entry in entries:
+            payload = entry.payload or {}
+            reason_code = payload.get("reason_code") or "candidate_rejected"
+            stage = payload.get("stage_reached")
+            key = (reason_code, stage)
+            item = grouped.get(key)
+            if item is None:
+                item = RejectionBreakdownItem(
+                    reason_code=reason_code,
+                    stage=stage,
+                    count=0,
+                    latest_market_title=payload.get("market_title"),
+                    latest_reason=payload.get("reason"),
+                )
+                grouped[key] = item
+            item.count += 1
+        return list(grouped.values())
 
     # ─── Positions ────────────────────────────────────
 
@@ -258,6 +322,7 @@ class DashboardService:
         the live in-memory activity buffer when the DB has no rows yet.
         """
         from data.models import Market
+        from data.models.logging import StructuredLogEntry
         from data.models.thesis import ThesisCard
         from data.models.workflow import WorkflowRun
 
@@ -283,6 +348,32 @@ class DashboardService:
         rows = result.all()
 
         if rows:
+            workflow_ids = [run.workflow_run_id for run, _, _ in rows]
+            counts_result = await self._session.execute(
+                select(
+                    StructuredLogEntry.workflow_run_id,
+                    StructuredLogEntry.market_id,
+                    StructuredLogEntry.event_type,
+                    StructuredLogEntry.logged_at,
+                )
+                .where(
+                    StructuredLogEntry.workflow_run_id.in_(workflow_ids),
+                    StructuredLogEntry.event_type.in_(("candidate_accepted", "candidate_rejected")),
+                )
+                .order_by(StructuredLogEntry.logged_at.asc())
+            )
+            latest_events: dict[str, dict[str, str]] = {}
+            for workflow_run_id, market_id, event_type, _ in counts_result.all():
+                latest_events.setdefault(workflow_run_id, {})[market_id or "workflow"] = event_type
+            counts: dict[str, dict[str, int]] = {}
+            for workflow_run_id, latest_per_market in latest_events.items():
+                accepted = sum(1 for event_type in latest_per_market.values() if event_type == "candidate_accepted")
+                counts[workflow_run_id] = {
+                    "reviewed": len(latest_per_market),
+                    "accepted": accepted,
+                    "rejected": len(latest_per_market) - accepted,
+                }
+
             return [
                 WorkflowRunSummary(
                     id=run.id,
@@ -290,10 +381,19 @@ class DashboardService:
                     status=run.status,
                     started_at=run.started_at,
                     completed_at=run.completed_at,
+                    estimated_cost_usd=run.estimated_cost_usd or 0.0,
                     cost_usd=run.actual_cost_usd or 0.0,
-                    candidates_reviewed=0,
-                    candidates_accepted=int(accepted_count or 0),
+                    candidates_reviewed=counts.get(run.workflow_run_id, {}).get("reviewed", int(accepted_count or 0)),
+                    candidates_accepted=counts.get(run.workflow_run_id, {}).get("accepted", int(accepted_count or 0)),
                     market_title=title,
+                    outcome=run.outcome,
+                    outcome_reason=run.outcome_reason,
+                    operator_mode=run.operator_mode,
+                    final_stage=(
+                        "execution"
+                        if int(accepted_count or 0) > 0
+                        else None
+                    ),
                 )
                 for run, title, accepted_count in rows
             ]
@@ -317,13 +417,157 @@ class DashboardService:
                 status=r["status"],
                 started_at=r.get("started_at"),
                 completed_at=r.get("completed_at"),
+                estimated_cost_usd=r.get("estimated_cost_usd", 0.0),
                 cost_usd=r.get("cost_usd", 0.0),
                 candidates_reviewed=r.get("candidates_reviewed", 0),
                 candidates_accepted=r.get("candidates_accepted", 0),
                 market_title=r.get("market_title"),
+                outcome=r.get("outcome"),
+                outcome_reason=r.get("outcome_reason"),
+                operator_mode=r.get("operator_mode"),
+                final_stage=r.get("final_stage"),
             )
             for r in runs_page
         ]
+
+    async def get_workflow_run_detail(self, workflow_id: uuid.UUID) -> WorkflowRunDetail | None:
+        """Get a full workflow detail payload including candidate diagnostics."""
+        from data.models import Market
+        from data.models.cost import CostGovernorDecision, PreRunCostEstimate
+        from data.models.logging import StructuredLogEntry
+        from data.models.workflow import WorkflowRun
+
+        result = await self._session.execute(
+            select(WorkflowRun, Market.title)
+            .outerjoin(Market, WorkflowRun.market_id == Market.id)
+            .where(WorkflowRun.id == workflow_id)
+        )
+        row = result.one_or_none()
+        if row is None:
+            return None
+
+        workflow_run, market_title = row
+
+        estimate_row = (
+            await self._session.execute(
+                select(PreRunCostEstimate)
+                .where(PreRunCostEstimate.workflow_run_id == workflow_run.id)
+                .order_by(PreRunCostEstimate.estimated_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        decision_row = (
+            await self._session.execute(
+                select(CostGovernorDecision)
+                .where(CostGovernorDecision.workflow_run_id == workflow_run.id)
+                .order_by(CostGovernorDecision.decided_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        candidate_logs = (
+            await self._session.execute(
+                select(StructuredLogEntry)
+                .where(
+                    StructuredLogEntry.workflow_run_id == workflow_run.workflow_run_id,
+                    StructuredLogEntry.event_type.in_(("candidate_accepted", "candidate_rejected")),
+                )
+                .order_by(StructuredLogEntry.logged_at.asc())
+            )
+        ).scalars().all()
+        accuracy_log = (
+            await self._session.execute(
+                select(StructuredLogEntry)
+                .where(
+                    StructuredLogEntry.workflow_run_id == workflow_run.workflow_run_id,
+                    StructuredLogEntry.event_type == "workflow_cost_accuracy",
+                )
+                .order_by(StructuredLogEntry.logged_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+        latest_by_market: dict[str, WorkflowCandidateDetail] = {}
+        for entry in candidate_logs:
+            payload = entry.payload or {}
+            market_id = payload.get("market_id") or entry.market_id or ""
+            latest_by_market[market_id] = WorkflowCandidateDetail(
+                market_id=market_id,
+                market_title=payload.get("market_title"),
+                category=payload.get("category"),
+                accepted=bool(payload.get("accepted")),
+                stage_reached=payload.get("stage_reached"),
+                reason=payload.get("reason"),
+                reason_code=payload.get("reason_code"),
+                reason_detail=payload.get("reason_detail"),
+                cost_spent_usd=float(payload.get("cost_spent_usd") or 0.0),
+                quantitative_context=payload.get("quantitative_context") or {},
+            )
+        candidate_outcomes = list(latest_by_market.values())
+
+        final_stage = None
+        if candidate_outcomes:
+            final_stage = candidate_outcomes[-1].stage_reached
+            if any(item.accepted for item in candidate_outcomes):
+                final_stage = "execution"
+
+        estimate_accuracy = None
+        if accuracy_log is not None and accuracy_log.payload:
+            payload = accuracy_log.payload
+            estimate_accuracy = WorkflowEstimateAccuracyDetail(
+                estimated_min_usd=float(payload.get("estimated_min_usd") or 0.0),
+                estimated_max_usd=float(payload.get("estimated_max_usd") or 0.0),
+                actual_usd=float(payload.get("actual_usd") or 0.0),
+                accuracy_ratio=float(payload.get("accuracy_ratio") or 0.0),
+                within_bounds=bool(payload.get("within_bounds")),
+            )
+
+        return WorkflowRunDetail(
+            id=workflow_run.id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_type=workflow_run.run_type,
+            status=workflow_run.status,
+            started_at=workflow_run.started_at,
+            completed_at=workflow_run.completed_at,
+            estimated_cost_usd=workflow_run.estimated_cost_usd or 0.0,
+            cost_usd=workflow_run.actual_cost_usd or 0.0,
+            candidates_reviewed=len(candidate_outcomes),
+            candidates_accepted=sum(1 for item in candidate_outcomes if item.accepted),
+            market_title=market_title,
+            outcome=workflow_run.outcome,
+            outcome_reason=workflow_run.outcome_reason,
+            operator_mode=workflow_run.operator_mode,
+            final_stage=final_stage,
+            models_used=list(workflow_run.models_used or []),
+            max_tier_used=workflow_run.max_tier_used,
+            cost_estimate=(
+                WorkflowCostEstimateDetail(
+                    expected_cost_min_usd=estimate_row.expected_cost_min_usd,
+                    expected_cost_max_usd=estimate_row.expected_cost_max_usd,
+                    daily_budget_remaining_usd=estimate_row.daily_budget_remaining_usd,
+                    lifetime_budget_remaining_usd=estimate_row.lifetime_budget_remaining_usd,
+                    daily_budget_pct_remaining=estimate_row.daily_budget_pct_remaining,
+                    estimated_at=estimate_row.estimated_at,
+                    agent_budgets=estimate_row.agent_budgets or {},
+                )
+                if estimate_row is not None
+                else None
+            ),
+            cost_decision=(
+                WorkflowCostDecisionDetail(
+                    decision=decision_row.decision,
+                    reason=decision_row.reason,
+                    approved_max_tier=decision_row.approved_max_tier,
+                    approved_max_cost_usd=decision_row.approved_max_cost_usd,
+                    cost_selectivity_ratio=decision_row.cost_selectivity_ratio,
+                    opus_escalation_threshold=decision_row.opus_escalation_threshold,
+                    decided_at=decision_row.decided_at,
+                )
+                if decision_row is not None
+                else None
+            ),
+            estimate_accuracy=estimate_accuracy,
+            candidate_outcomes=candidate_outcomes,
+        )
 
     # ─── Trigger Events ──────────────────────────────
 

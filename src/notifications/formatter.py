@@ -119,6 +119,12 @@ def format_no_trade(envelope: NotificationEnvelope) -> str:
         f"Candidates reviewed: {p.candidates_reviewed}",
         f"Reason: {p.reason}",
     ]
+    if p.stage:
+        lines.append(f"Stage: {p.stage}")
+    if p.reason_code:
+        lines.append(f"Code: {p.reason_code}")
+    if p.reason_detail:
+        lines.append(f"Detail: {p.reason_detail}")
     if p.top_rejected_market:
         lines.append(f"Top rejected: {p.top_rejected_market}")
     if p.rejection_reasons:

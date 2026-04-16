@@ -29,6 +29,7 @@ risk:
   max_correlation_burden_score: 0.8
   max_order_depth_fraction: 0.12
   max_entry_impact_edge_fraction: 0.25
+  min_viable_impact_adjusted_edge: 0.002
   depth_levels_for_sizing: 3
   sizing_base_fraction: 0.05
   ambiguity_penalty_weight: 0.3

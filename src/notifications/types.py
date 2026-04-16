@@ -118,9 +118,13 @@ class NoTradePayload(BaseModel):
 
     workflow_run_duration_seconds: float
     reason: str  # healthy_no_trade, failed_workflow, stalled_scheduler
+    stage: str | None = None
+    reason_code: str | None = None
+    reason_detail: str | None = None
     candidates_reviewed: int
     top_rejected_market: str | None = None
     rejection_reasons: list[str] = Field(default_factory=list)
+    quantitative_context: dict[str, Any] = Field(default_factory=dict)
     is_healthy: bool = True  # False indicates workflow failure, not quality filtering
 
 

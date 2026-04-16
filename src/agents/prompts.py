@@ -115,9 +115,10 @@ _ROLE_TEMPLATES: dict[str, str] = {
         "You are the Investigator Orchestration Agent — the final synthesis authority. "
         "Weigh all domain manager findings, evidence quality, counter-cases, and "
         "resolution risks to produce a definitive thesis card or no-trade decision. "
-        "Be adversarial: actively seek reasons NOT to enter the trade. "
-        "Most markets should result in no-trade — this is correct. "
-        "Produce structured output with all thesis card fields."
+        "This candidate has already passed deterministic screening (rubric score, net edge, "
+        "entry impact checks). Your job is to assess whether the thesis is coherent and "
+        "the edge appears genuine — not to re-run the quantitative filters. "
+        "Respond with raw JSON only (no markdown formatting)."
     ),
     "performance_analyzer": (
         "You are the Performance Analyzer — providing weekly strategic synthesis. "

@@ -120,9 +120,15 @@ class MarketInfo(BaseModel):
         """Parse a single market object from Gamma API response."""
         import json as _json
 
+        def _first_present(*keys: str) -> object | None:
+            for key in keys:
+                if key in data and data.get(key) is not None:
+                    return data.get(key)
+            return None
+
         # Token IDs: clobTokenIds is a JSON-encoded string e.g. '["id1","id2"]'
         token_ids: list[str] = []
-        raw_clob = data.get("clobTokenIds")
+        raw_clob = _first_present("clobTokenIds", "clob_token_ids")
         if isinstance(raw_clob, str):
             try:
                 parsed = _json.loads(raw_clob)
@@ -132,9 +138,15 @@ class MarketInfo(BaseModel):
                 pass
         elif isinstance(raw_clob, list):
             token_ids = [str(t) for t in raw_clob]
+        elif isinstance(data.get("tokens"), list):
+            token_ids = [
+                str(token.get("token_id") or token.get("tokenId"))
+                for token in data["tokens"]
+                if isinstance(token, dict) and (token.get("token_id") or token.get("tokenId"))
+            ]
 
         end_date = None
-        end_date_raw = data.get("endDateIso")
+        end_date_raw = _first_present("endDateIso", "end_date_iso")
         if end_date_raw:
             try:
                 from datetime import timezone
@@ -145,8 +157,12 @@ class MarketInfo(BaseModel):
                 pass
 
         return cls(
-            market_id=str(data.get("id", data.get("conditionId", ""))),
-            condition_id=data.get("conditionId"),
+            market_id=str(_first_present("id", "market_id", "conditionId", "condition_id") or ""),
+            condition_id=(
+                str(_first_present("conditionId", "condition_id"))
+                if _first_present("conditionId", "condition_id") is not None
+                else None
+            ),
             token_ids=token_ids,
             title=data.get("question", data.get("title", "")),
             description=data.get("description"),
@@ -155,12 +171,12 @@ class MarketInfo(BaseModel):
             slug=data.get("slug"),
             end_date=end_date,
             is_active=data.get("active", True),
-            volume_24h=_safe_float(data.get("volume24hr")),
-            liquidity=_safe_float(data.get("liquidityNum")),
+            volume_24h=_safe_float(_first_present("volume24hr", "volume_24hr", "volume_num_24hr")),
+            liquidity=_safe_float(_first_present("liquidityNum", "liquidity_num")),
             spread=_safe_float(data.get("spread")),
-            resolution_source=data.get("resolutionSource") or None,
-            price=_safe_float(data.get("lastTradePrice") or data.get("price")),
-            mid_price=_safe_float(data.get("midPrice") or data.get("mid_price")),
+            resolution_source=_first_present("resolutionSource", "resolution_source") or None,
+            price=_safe_float(_first_present("lastTradePrice", "last_trade_price", "price")),
+            mid_price=_safe_float(_first_present("midPrice", "mid_price")),
         )
 
 

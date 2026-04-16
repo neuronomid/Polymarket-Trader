@@ -115,6 +115,7 @@ class RiskConfig(BaseSettings):
     # Liquidity-relative sizing
     max_order_depth_fraction: float = 0.12  # 12% of visible depth at top 3 levels
     max_entry_impact_edge_fraction: float = 0.25  # reject if impact > 25% of gross edge
+    min_viable_impact_adjusted_edge: float = 0.002  # deterministic minimum for investigation viability
     depth_levels_for_sizing: int = 3
 
     # Position sizing multipliers and penalties

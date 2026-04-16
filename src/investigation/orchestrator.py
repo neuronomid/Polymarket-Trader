@@ -42,6 +42,7 @@ from core.enums import CostClass, ModelTier
 from cost.types import (
     AgentCostSpec,
     CostApproval,
+    CostEstimate,
     CostEstimateRequest,
     RunType,
 )
@@ -67,6 +68,7 @@ from investigation.thesis_builder import ThesisCardBuilder
 from investigation.types import (
     BaseRateResult,
     CandidateContext,
+    CandidateInvestigationResult,
     DomainMemo,
     EntryImpactResult,
     EvidenceItem,
@@ -164,13 +166,42 @@ class InvestigationOrchestrator:
         )
 
         # --- Step 1: Pre-run cost estimate → Cost Governor approval ---
-        cost_approval = await self._get_cost_approval(request)
+        cost_estimate, cost_approval = await self._prepare_cost_gate(request)
+        result.cost_estimate = cost_estimate
+        result.cost_approval = cost_approval
+        if cost_estimate is not None:
+            result.estimated_cost_usd = round(cost_estimate.expected_cost_max_usd, 6)
         if cost_approval is not None and not cost_approval.is_approved:
             result.outcome = InvestigationOutcome.COST_REJECTED
-            result.no_trade_results.append(NoTradeResult(
+            no_trade = NoTradeResult(
+                market_id=request.candidates[0].market_id if request.candidates else None,
+                market_title=request.candidates[0].title if request.candidates else None,
+                category=request.candidates[0].category if request.candidates else None,
                 reason=f"Cost Governor rejected: {cost_approval.reason}",
-                reason_code="cost_governor_rejected",
+                reason_code="cost_governor_reject",
                 stage="pre_run_cost_check",
+                reason_detail=cost_approval.reason,
+                quantitative_context={
+                    "approved_max_cost_usd": cost_approval.approved_max_cost_usd,
+                    "approved_max_tier": (
+                        cost_approval.approved_max_tier.value
+                        if cost_approval.approved_max_tier is not None
+                        else None
+                    ),
+                },
+            )
+            result.no_trade_results.append(no_trade)
+            result.candidate_outcomes.append(CandidateInvestigationResult(
+                market_id=no_trade.market_id or "workflow",
+                market_title=no_trade.market_title or "",
+                category=no_trade.category or "unknown",
+                accepted=False,
+                stage_reached=no_trade.stage,
+                reason=no_trade.reason,
+                reason_code=no_trade.reason_code,
+                reason_detail=no_trade.reason_detail,
+                quantitative_context=no_trade.quantitative_context,
+                no_trade_result=no_trade,
             ))
             result.completed_at = datetime.now(tz=UTC)
             _log.info(
@@ -204,7 +235,7 @@ class InvestigationOrchestrator:
         # --- Step 3: Investigate each candidate ---
         for candidate in candidates:
             try:
-                thesis_card = await self._investigate_candidate(
+                candidate_result = await self._investigate_candidate(
                     candidate=candidate,
                     regime=regime,
                     max_approved_tier=max_approved_tier,
@@ -213,16 +244,31 @@ class InvestigationOrchestrator:
                     models_used=models_used,
                     agent_costs=result.agent_costs,
                 )
-
-                if thesis_card is not None:
-                    result.thesis_cards.append(thesis_card)
-                else:
-                    result.no_trade_results.append(NoTradeResult(
+                if candidate_result is None:
+                    no_trade = NoTradeResult(
                         market_id=candidate.market_id,
+                        market_title=candidate.title,
+                        category=candidate.category,
                         reason="Candidate did not survive investigation",
-                        reason_code="investigation_rejected",
+                        reason_code="investigation_error",
                         stage="investigation_complete",
-                    ))
+                    )
+                    candidate_result = CandidateInvestigationResult(
+                        market_id=candidate.market_id,
+                        market_title=candidate.title,
+                        category=candidate.category,
+                        accepted=False,
+                        stage_reached=no_trade.stage,
+                        reason=no_trade.reason,
+                        reason_code=no_trade.reason_code,
+                        no_trade_result=no_trade,
+                    )
+                result.candidate_outcomes.append(candidate_result)
+
+                if candidate_result.accepted and candidate_result.thesis_card is not None:
+                    result.thesis_cards.append(candidate_result.thesis_card)
+                elif candidate_result.no_trade_result is not None:
+                    result.no_trade_results.append(candidate_result.no_trade_result)
 
             except Exception as exc:
                 _log.error(
@@ -230,11 +276,26 @@ class InvestigationOrchestrator:
                     market_id=candidate.market_id,
                     error=str(exc),
                 )
-                result.no_trade_results.append(NoTradeResult(
+                no_trade = NoTradeResult(
                     market_id=candidate.market_id,
+                    market_title=candidate.title,
+                    category=candidate.category,
                     reason=f"Investigation error: {str(exc)}",
                     reason_code="investigation_error",
                     stage="investigation_execution",
+                    reason_detail=str(exc),
+                )
+                result.no_trade_results.append(no_trade)
+                result.candidate_outcomes.append(CandidateInvestigationResult(
+                    market_id=candidate.market_id,
+                    market_title=candidate.title,
+                    category=candidate.category or "unknown",
+                    accepted=False,
+                    stage_reached=no_trade.stage,
+                    reason=no_trade.reason,
+                    reason_code=no_trade.reason_code,
+                    reason_detail=no_trade.reason_detail,
+                    no_trade_result=no_trade,
                 ))
 
         # --- Finalize result ---
@@ -243,6 +304,14 @@ class InvestigationOrchestrator:
             result.candidates_accepted = len(result.thesis_cards)
 
         result.actual_cost_usd = round(sum(result.agent_costs.values()), 6)
+        if cost_estimate is not None and self._cost_governor is not None:
+            result.estimate_accuracy = self._cost_governor.record_estimate_accuracy(
+                workflow_run_id=request.workflow_run_id,
+                run_type=self._run_type_for_mode(request.mode),
+                estimated_min_usd=cost_estimate.expected_cost_min_usd,
+                estimated_max_usd=cost_estimate.expected_cost_max_usd,
+                actual_usd=result.actual_cost_usd,
+            )
         result.models_used = sorted(models_used)
         result.max_tier_used = max_tier
         result.completed_at = datetime.now(tz=UTC)
@@ -271,12 +340,13 @@ class InvestigationOrchestrator:
         ask_levels: list[OrderBookLevel],
         models_used: set[str],
         agent_costs: dict[str, float],
-    ) -> ThesisCardData | None:
+    ) -> CandidateInvestigationResult:
         """Run the full investigation pipeline for a single candidate.
 
-        Returns ThesisCardData if the candidate survives, None for no-trade.
+        Returns the explicit candidate outcome.
         """
         workflow_run_id = f"inv-{candidate.market_id}-{uuid.uuid4().hex[:8]}"
+        candidate_cost_spent = 0.0
 
         _log.info(
             "candidate_investigation_started",
@@ -285,11 +355,20 @@ class InvestigationOrchestrator:
             trigger_class=candidate.trigger_class,
         )
 
+        metadata_rejection = self._validate_candidate_metadata(candidate)
+        if metadata_rejection is not None:
+            return self._candidate_rejection(
+                candidate,
+                no_trade=metadata_rejection,
+                cost_spent_usd=0.0,
+            )
+
         # --- Step 4: Assign domain manager ---
         domain_memo, domain_role, domain_cost = await self._run_domain_manager(
             candidate, regime, workflow_run_id, models_used,
         )
         agent_costs[domain_role] = agent_costs.get(domain_role, 0.0) + domain_cost
+        candidate_cost_spent += domain_cost
 
         if domain_memo is None:
             _log.info(
@@ -297,33 +376,46 @@ class InvestigationOrchestrator:
                 market_id=candidate.market_id,
                 category=candidate.category,
             )
-            return None
+            return self._candidate_rejection(
+                candidate,
+                no_trade=NoTradeResult(
+                    market_id=candidate.market_id,
+                    market_title=candidate.title,
+                    category=candidate.category,
+                    reason="Domain manager failed to produce a memo",
+                    reason_code="domain_manager_failed",
+                    stage="domain_manager",
+                    reason_detail="Domain manager output was empty or invalid.",
+                ),
+                cost_spent_usd=candidate_cost_spent,
+            )
 
         if not domain_memo.recommended_proceed:
-            # If the LLM provided a probability estimate or direction, allow
-            # investigation to continue — downstream checks (rubric, net edge,
-            # risk governor) will still filter bad candidates.
-            has_signal = (
-                domain_memo.estimated_probability is not None
-                or domain_memo.probability_direction is not None
-            )
-            if not has_signal:
-                _log.info(
-                    "candidate_rejected_no_proceed_no_signal",
-                    market_id=candidate.market_id,
-                    title=candidate.title[:60] if candidate.title else "",
-                    category=candidate.category,
-                    confidence_level=domain_memo.confidence_level,
-                    concerns=domain_memo.concerns[:3] if domain_memo.concerns else [],
-                    summary=domain_memo.summary[:120] if domain_memo.summary else "",
-                )
-                return None
             _log.info(
-                "domain_no_proceed_but_has_signal_continuing",
+                "candidate_rejected_no_proceed",
                 market_id=candidate.market_id,
-                estimated_prob=domain_memo.estimated_probability,
-                direction=domain_memo.probability_direction,
-                confidence=domain_memo.confidence_level,
+                title=candidate.title[:60] if candidate.title else "",
+                category=candidate.category,
+                confidence_level=domain_memo.confidence_level,
+                concerns=domain_memo.concerns[:3] if domain_memo.concerns else [],
+                summary=domain_memo.summary[:120] if domain_memo.summary else "",
+            )
+            return self._candidate_rejection(
+                candidate,
+                no_trade=NoTradeResult(
+                    market_id=candidate.market_id,
+                    market_title=candidate.title,
+                    category=candidate.category,
+                    reason="Domain manager recommended against proceeding",
+                    reason_code="domain_manager_reject",
+                    stage="domain_manager",
+                    reason_detail=domain_memo.summary or None,
+                    quantitative_context={
+                        "confidence_level": domain_memo.confidence_level,
+                        "concerns": domain_memo.concerns[:5],
+                    },
+                ),
+                cost_spent_usd=candidate_cost_spent,
             )
 
         # --- Step 5: Run research pack (5 default agents) ---
@@ -340,6 +432,7 @@ class InvestigationOrchestrator:
         # Merge all per-agent costs (pack + optional) into the run-level accumulator
         for role, cost in research.per_agent_costs.items():
             agent_costs[role] = agent_costs.get(role, 0.0) + cost
+        candidate_cost_spent += research.total_research_cost_usd
 
         # --- Step 7: Compute entry impact (Tier D) ---
         entry_impact = self._impact_calc.compute(
@@ -396,7 +489,28 @@ class InvestigationOrchestrator:
             domain_proceed=domain_memo.recommended_proceed,
         )
         if rubric_score.composite_score < MIN_COMPOSITE_FOR_ACCEPTANCE:
-            return None
+            return self._candidate_rejection(
+                candidate,
+                no_trade=NoTradeResult(
+                    market_id=candidate.market_id,
+                    market_title=candidate.title,
+                    category=candidate.category,
+                    reason="Composite rubric score below acceptance threshold",
+                    reason_code="rubric_below_threshold",
+                    stage="rubric",
+                    reason_detail=(
+                        f"Composite score {rubric_score.composite_score:.4f} "
+                        f"below threshold {MIN_COMPOSITE_FOR_ACCEPTANCE:.4f}"
+                    ),
+                    quantitative_context={
+                        "composite_score": rubric_score.composite_score,
+                        "threshold": MIN_COMPOSITE_FOR_ACCEPTANCE,
+                        "gross_edge": gross_edge,
+                    },
+                    rubric_score=rubric_score,
+                ),
+                cost_spent_usd=candidate_cost_spent,
+            )
 
         # --- Step 11: Compute net edge (Tier D) ---
         spread_friction = candidate.spread or 0.0
@@ -410,6 +524,7 @@ class InvestigationOrchestrator:
             net_edge_after_cost=round(
                 gross_edge - spread_friction / 2 - slippage_fraction - inference_cost_as_edge, 6
             ),
+            min_viable_edge=self._min_net_edge,
         )
 
         # Check: positive gross edge but non-viable impact-adjusted edge
@@ -420,7 +535,30 @@ class InvestigationOrchestrator:
                 gross_edge=net_edge.gross_edge,
                 impact_adjusted_edge=net_edge.impact_adjusted_edge,
             )
-            return None
+            return self._candidate_rejection(
+                candidate,
+                no_trade=NoTradeResult(
+                    market_id=candidate.market_id,
+                    market_title=candidate.title,
+                    category=candidate.category,
+                    reason="Impact-adjusted edge is not viable after friction",
+                    reason_code="impact_adjusted_edge_nonviable",
+                    stage="net_edge",
+                    reason_detail=(
+                        f"Impact-adjusted edge {net_edge.impact_adjusted_edge:.6f} "
+                        f"did not exceed minimum {self._min_net_edge:.6f}"
+                    ),
+                    quantitative_context={
+                        "gross_edge": net_edge.gross_edge,
+                        "friction_adjusted_edge": net_edge.friction_adjusted_edge,
+                        "impact_adjusted_edge": net_edge.impact_adjusted_edge,
+                        "net_edge_after_cost": net_edge.net_edge_after_cost,
+                        "min_viable_edge": self._min_net_edge,
+                    },
+                    rubric_score=rubric_score,
+                ),
+                cost_spent_usd=candidate_cost_spent,
+            )
 
         # --- Step 12: Entry impact check (25% of gross edge max) ---
         if gross_edge > 0:
@@ -434,7 +572,29 @@ class InvestigationOrchestrator:
                     impact_fraction=impact_fraction,
                     max_fraction=self._max_impact_fraction,
                 )
-                return None
+                return self._candidate_rejection(
+                    candidate,
+                    no_trade=NoTradeResult(
+                        market_id=candidate.market_id,
+                        market_title=candidate.title,
+                        category=candidate.category,
+                        reason="Entry impact consumes too much of gross edge",
+                        reason_code="entry_impact_too_high",
+                        stage="entry_impact",
+                        reason_detail=(
+                            f"Impact fraction {impact_fraction:.4f} exceeded "
+                            f"maximum {self._max_impact_fraction:.4f}"
+                        ),
+                        quantitative_context={
+                            "impact_fraction": impact_fraction,
+                            "max_impact_fraction": self._max_impact_fraction,
+                            "estimated_impact_bps": entry_impact.estimated_impact_bps,
+                            "gross_edge": gross_edge,
+                        },
+                        rubric_score=rubric_score,
+                    ),
+                    cost_spent_usd=candidate_cost_spent,
+                )
 
         # --- Step 13: Adversarial synthesis (Opus, if qualified) ---
         orchestrator_output, synthesis_cost = await self._run_orchestrator_synthesis(
@@ -452,9 +612,26 @@ class InvestigationOrchestrator:
             models_used=models_used,
         )
         agent_costs["investigator_orchestration"] = agent_costs.get("investigator_orchestration", 0.0) + synthesis_cost
+        candidate_cost_spent += synthesis_cost
 
         if orchestrator_output is None:
-            return None
+            return self._candidate_rejection(
+                candidate,
+                no_trade=NoTradeResult(
+                    market_id=candidate.market_id,
+                    market_title=candidate.title,
+                    category=candidate.category,
+                    reason="Investigation synthesis failed",
+                    reason_code="investigation_error",
+                    stage="orchestrator_synthesis",
+                    reason_detail="Final orchestration output was unavailable.",
+                    quantitative_context={
+                        "gross_edge": net_edge.gross_edge,
+                        "impact_adjusted_edge": net_edge.impact_adjusted_edge,
+                    },
+                ),
+                cost_spent_usd=candidate_cost_spent,
+            )
 
         # Check if orchestrator decided no-trade
         if orchestrator_output.get("decision") == "no_trade":
@@ -463,7 +640,25 @@ class InvestigationOrchestrator:
                 market_id=candidate.market_id,
                 reason=orchestrator_output.get("no_trade_reason", ""),
             )
-            return None
+            return self._candidate_rejection(
+                candidate,
+                no_trade=NoTradeResult(
+                    market_id=candidate.market_id,
+                    market_title=candidate.title,
+                    category=candidate.category,
+                    reason="Final orchestration rejected the candidate",
+                    reason_code="orchestrator_reject",
+                    stage="orchestrator_synthesis",
+                    reason_detail=orchestrator_output.get("no_trade_reason"),
+                    quantitative_context={
+                        "gross_edge": net_edge.gross_edge,
+                        "impact_adjusted_edge": net_edge.impact_adjusted_edge,
+                        "net_edge_after_cost": net_edge.net_edge_after_cost,
+                    },
+                    rubric_score=rubric_score,
+                ),
+                cost_spent_usd=candidate_cost_spent,
+            )
 
         # --- Step 14: Build thesis card ---
         card = self._thesis_builder.build(
@@ -479,7 +674,86 @@ class InvestigationOrchestrator:
             inference_cost_usd=research.total_research_cost_usd,
         )
 
-        return card
+        return CandidateInvestigationResult(
+            market_id=candidate.market_id,
+            market_title=candidate.title,
+            category=candidate.category,
+            accepted=True,
+            stage_reached="investigation_complete",
+            reason="Candidate accepted",
+            reason_code="candidate_accepted",
+            quantitative_context={
+                "gross_edge": net_edge.gross_edge,
+                "impact_adjusted_edge": net_edge.impact_adjusted_edge,
+                "net_edge_after_cost": net_edge.net_edge_after_cost,
+                "composite_score": rubric_score.composite_score,
+            },
+            cost_spent_usd=round(candidate_cost_spent, 6),
+            thesis_card=card,
+        )
+
+    def _candidate_rejection(
+        self,
+        candidate: CandidateContext,
+        *,
+        no_trade: NoTradeResult,
+        cost_spent_usd: float,
+    ) -> CandidateInvestigationResult:
+        """Build a structured rejected-candidate outcome."""
+        no_trade.cost_spent_usd = round(cost_spent_usd, 6)
+        if no_trade.market_id is None:
+            no_trade.market_id = candidate.market_id
+        if no_trade.market_title is None:
+            no_trade.market_title = candidate.title
+        if no_trade.category is None:
+            no_trade.category = candidate.category
+        return CandidateInvestigationResult(
+            market_id=candidate.market_id,
+            market_title=candidate.title,
+            category=candidate.category or "unknown",
+            accepted=False,
+            stage_reached=no_trade.stage,
+            reason=no_trade.reason,
+            reason_code=no_trade.reason_code,
+            reason_detail=no_trade.reason_detail,
+            quantitative_context=no_trade.quantitative_context,
+            cost_spent_usd=no_trade.cost_spent_usd,
+            no_trade_result=no_trade,
+        )
+
+    def _validate_candidate_metadata(
+        self,
+        candidate: CandidateContext,
+    ) -> NoTradeResult | None:
+        """Reject candidates with incomplete metadata before any LLM stage."""
+        issues = list(candidate.metadata_issues)
+        if not candidate.title.strip():
+            issues.append("missing_title")
+        if candidate.category in ("", "metadata_incomplete"):
+            issues.append("missing_category")
+        if candidate.category == "unknown":
+            issues.append("unknown_category")
+        if candidate.metadata_status == "unknown_category" and "unknown_category" not in issues:
+            issues.append("unknown_category")
+        if candidate.metadata_status == "metadata_incomplete" and "metadata_incomplete" not in issues:
+            issues.append("metadata_incomplete")
+        if not issues:
+            return None
+
+        reason_code = "unknown_category" if "unknown_category" in issues else "metadata_incomplete"
+        return NoTradeResult(
+            market_id=candidate.market_id,
+            market_title=candidate.title,
+            category=candidate.category or "unknown",
+            reason="Candidate metadata was incomplete before investigation",
+            reason_code=reason_code,
+            stage="metadata_validation",
+            reason_detail=", ".join(sorted(set(issues))),
+            quantitative_context={
+                "metadata_status": candidate.metadata_status,
+                "metadata_issues": sorted(set(issues)),
+            },
+        )
 
     # --- Sub-component runners ---
 
@@ -821,23 +1095,26 @@ class InvestigationOrchestrator:
 
     # --- Private helpers ---
 
-    async def _get_cost_approval(
-        self,
-        request: InvestigationRequest,
-    ) -> CostApproval | None:
-        """Get Cost Governor pre-approval for the investigation run."""
-        if self._cost_governor is None:
-            return None
-
+    def _run_type_for_mode(self, mode: InvestigationMode) -> RunType:
+        """Map investigation modes to Cost Governor run types."""
         run_type_map = {
             InvestigationMode.SCHEDULED_SWEEP: RunType.SCHEDULED_SWEEP,
             InvestigationMode.TRIGGER_BASED: RunType.TRIGGER_BASED,
             InvestigationMode.OPERATOR_FORCED: RunType.OPERATOR_FORCED,
         }
+        return run_type_map.get(mode, RunType.SCHEDULED_SWEEP)
+
+    async def _prepare_cost_gate(
+        self,
+        request: InvestigationRequest,
+    ) -> tuple[CostEstimate | None, CostApproval | None]:
+        """Compute the pre-run estimate and Cost Governor decision."""
+        if self._cost_governor is None:
+            return None, None
 
         cost_request = CostEstimateRequest(
             workflow_run_id=request.workflow_run_id,
-            run_type=run_type_map.get(request.mode, RunType.SCHEDULED_SWEEP),
+            run_type=self._run_type_for_mode(request.mode),
             candidate_count=min(len(request.candidates), request.max_candidates),
             agent_specs=[
                 AgentCostSpec(agent_role="domain_manager", tier=ModelTier.B, cost_class=CostClass.M),
@@ -851,7 +1128,7 @@ class InvestigationOrchestrator:
         )
 
         estimate = self._cost_governor.estimate(cost_request)
-        return self._cost_governor.approve(estimate)
+        return estimate, self._cost_governor.approve(estimate)
 
     def _rank_candidates(
         self,
@@ -936,29 +1213,37 @@ class _OrchestratorAgent(BaseAgent):
         result = AgentResult(agent_role=self.role_name)
 
         ctx = agent_input.context
+        net_edge_data = ctx.get('net_edge', {})
+        rubric_score = ctx.get('rubric_score', {}).get('composite_score', 0)
+        gross_edge = net_edge_data.get('gross_edge', 0)
+        impact_adj_edge = net_edge_data.get('impact_adjusted_edge', 0)
+
         user_prompt = (
-            "You are performing final adversarial synthesis for a market candidate.\n\n"
+            "Perform final synthesis for this investigated market candidate.\n\n"
             f"Market: {ctx.get('candidate', {}).get('title', 'Unknown')}\n"
             f"Category: {ctx.get('candidate', {}).get('category', 'Unknown')}\n\n"
-            f"Domain Analysis Summary:\n{ctx.get('domain_memo', {}).get('summary', 'N/A')}\n\n"
+            f"Domain Analysis Summary:\n{ctx.get('domain_memo', {}).get('summary', 'N/A')}\n"
+            f"Domain Estimated Probability: {ctx.get('domain_memo', {}).get('estimated_probability', 'N/A')}\n"
+            f"Probability Direction: {ctx.get('domain_memo', {}).get('probability_direction', 'N/A')}\n\n"
             f"Evidence ({len(ctx.get('evidence_summary', []))} items):\n"
             f"{json.dumps(ctx.get('evidence_summary', [])[:3], indent=2, default=str)}\n\n"
             f"Counter-Case:\n{json.dumps(ctx.get('counter_case', {}), indent=2, default=str)}\n\n"
             f"Resolution Review:\n{json.dumps(ctx.get('resolution_review', {}), indent=2, default=str)}\n\n"
-            f"Net Edge: {json.dumps(ctx.get('net_edge', {}), indent=2)}\n"
+            f"Gross Edge: {gross_edge:.4f} | Impact-Adjusted Edge: {impact_adj_edge:.4f}\n"
             f"Entry Impact: {ctx.get('entry_impact_bps', 0):.1f} bps\n"
             f"Base Rate: {ctx.get('base_rate', {}).get('base_rate', 0.5)}\n"
-            f"Rubric Score: {ctx.get('rubric_score', {}).get('composite_score', 0)}\n\n"
-            "Weigh ALL evidence and produce ONE of:\n"
-            '1. {"decision": "accept", "proposed_side": "yes"|"no", '
+            f"Rubric Score: {rubric_score:.3f} (passed threshold)\n\n"
+            "This candidate has already passed deterministic screening (rubric, edge, impact checks). "
+            "Your role is to assess whether the thesis is well-grounded and the edge is genuine.\n\n"
+            "Respond with ONLY a raw JSON object (no markdown, no code blocks):\n"
+            'If the evidence supports a genuine edge: {"decision": "accept", "proposed_side": "yes" or "no", '
             '"core_thesis": "...", "why_mispriced": "...", '
             '"probability_estimate": 0.0-1.0, "confidence_estimate": 0.0-1.0, '
             '"calibration_confidence": 0.0-1.0, "confidence_note": "...", '
             '"invalidation_conditions": ["..."], '
             '"supporting_evidence": [...], "opposing_evidence": [...], '
-            '"resolution_risk_summary": "..."}\n\n'
-            '2. {"decision": "no_trade", "no_trade_reason": "..."}\n\n'
-            "Remember: most markets should result in no-trade. Be adversarial."
+            '"resolution_risk_summary": "..."}\n'
+            'If the evidence does NOT support a genuine edge: {"decision": "no_trade", "no_trade_reason": "..."}'
         )
 
         response = await self.call_llm(
@@ -970,9 +1255,31 @@ class _OrchestratorAgent(BaseAgent):
             max_tokens=3072,
         )
 
+        # Parse JSON — handle both raw JSON and markdown-wrapped JSON
+        content = response.content.strip()
         try:
-            output = json.loads(response.content)
+            output = json.loads(content)
         except (json.JSONDecodeError, TypeError):
-            output = {"decision": "no_trade", "no_trade_reason": "Failed to parse synthesis output"}
+            import re as _re
+            # Try extracting from markdown code block (Claude often wraps JSON)
+            match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, _re.DOTALL)
+            if match:
+                try:
+                    output = json.loads(match.group(1))
+                except (json.JSONDecodeError, TypeError):
+                    output = None
+            else:
+                output = None
+
+            if output is None:
+                _log.warning(
+                    "orchestrator_synthesis_parse_failed",
+                    market_id=agent_input.market_id,
+                    content_preview=content[:200],
+                )
+                output = {
+                    "decision": "no_trade",
+                    "no_trade_reason": "Synthesis output could not be parsed into valid JSON",
+                }
 
         return output

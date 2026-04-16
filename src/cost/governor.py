@@ -23,6 +23,7 @@ from cost.types import (
     CostEstimate,
     CostEstimateRequest,
     CostRecordInput,
+    EstimateAccuracy,
     ReviewCostStatus,
     RunType,
     SelectivitySnapshot,
@@ -200,9 +201,9 @@ class CostGovernor:
         estimated_min_usd: float,
         estimated_max_usd: float,
         actual_usd: float,
-    ) -> None:
+    ) -> EstimateAccuracy:
         """Record estimate vs actual for the feedback loop."""
-        self._feedback.record(
+        return self._feedback.record(
             workflow_run_id=workflow_run_id,
             run_type=run_type,
             estimated_min_usd=estimated_min_usd,

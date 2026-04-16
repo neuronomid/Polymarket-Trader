@@ -21,6 +21,9 @@ from core.enums import TriggerClass, TriggerLevel
 from market_data.types import CachedMarketData
 from scanner.types import MarketWatchEntry, TriggerEvent, TriggerThresholds
 
+_ENTRY_EXTREME_PRICE_FLOOR = 0.04
+_ENTRY_EXTREME_PRICE_CEILING = 0.96
+
 
 class TriggerDetector:
     """Deterministic trigger detection for market data changes.
@@ -50,20 +53,29 @@ class TriggerDetector:
 
         snapshot = current_data.snapshot
         source = current_data.source.value
+        current_price = snapshot.mid_price
 
         # --- Price move detection ---
-        price_trigger = self._check_price_move(watch_entry, snapshot.mid_price, source)
+        price_trigger = self._check_price_move(watch_entry, current_price, source)
         if price_trigger:
             triggers.append(price_trigger)
 
         # --- Spread detection ---
-        spread_trigger = self._check_spread_change(watch_entry, snapshot.spread, source)
+        spread_trigger = self._check_spread_change(
+            watch_entry,
+            snapshot.spread,
+            current_price,
+            source,
+        )
         if spread_trigger:
             triggers.append(spread_trigger)
 
         # --- Depth change detection ---
         depth_trigger = self._check_depth_change(
-            watch_entry, snapshot.depth_levels, source
+            watch_entry,
+            snapshot.depth_levels,
+            current_price,
+            source,
         )
         if depth_trigger:
             triggers.append(depth_trigger)
@@ -100,6 +112,9 @@ class TriggerDetector:
             return None
 
         if entry.last_price == 0:
+            return None
+
+        if self._is_extreme_entry_market(entry, current_price):
             return None
 
         change_pct = abs(current_price - entry.last_price) / entry.last_price
@@ -145,10 +160,14 @@ class TriggerDetector:
         self,
         entry: MarketWatchEntry,
         current_spread: float | None,
+        current_price: float | None,
         source: str,
     ) -> TriggerEvent | None:
         """Detect spread widening or narrowing past limits."""
         if current_spread is None:
+            return None
+
+        if self._is_extreme_entry_market(entry, current_price):
             return None
 
         thresholds = self._thresholds
@@ -207,10 +226,14 @@ class TriggerDetector:
         self,
         entry: MarketWatchEntry,
         current_depth_levels: dict | None,
+        current_price: float | None,
         source: str,
     ) -> TriggerEvent | None:
         """Detect sudden depth changes at top levels."""
         if current_depth_levels is None or entry.last_depth_top3 is None:
+            return None
+
+        if self._is_extreme_entry_market(entry, current_price):
             return None
 
         # Compute current top-3 depth
@@ -358,6 +381,33 @@ class TriggerDetector:
                 )
 
         return triggers
+
+    def _is_extreme_entry_market(
+        self,
+        entry: MarketWatchEntry,
+        current_price: float | None,
+    ) -> bool:
+        """Skip entry-style triggers for unheld markets near certainty.
+
+        The workflow layer rejects new candidates below 4% or above 96%
+        because those prices are too extreme to treat as fresh entry
+        opportunities. Mirror that rule in the scanner so tiny absolute moves
+        on penny-longshots do not get surfaced as C/D opportunities.
+        """
+        if entry.is_held_position:
+            return False
+
+        reference_price = (
+            current_price
+            if current_price is not None
+            else entry.last_price
+        )
+        if reference_price is None:
+            return False
+        return (
+            reference_price < _ENTRY_EXTREME_PRICE_FLOOR
+            or reference_price > _ENTRY_EXTREME_PRICE_CEILING
+        )
 
     def _check_catalyst_window(
         self,
