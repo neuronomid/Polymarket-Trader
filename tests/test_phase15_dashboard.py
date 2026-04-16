@@ -1226,6 +1226,72 @@ class TestWorkflowAndTriggerDB:
         assert evt.price == 0.55
         assert evt.spread == 0.03
 
+    async def test_get_trigger_events_classifies_missing_category(
+        self, session: AsyncSession
+    ):
+        """Trigger events fall back to deterministic category classification."""
+        market = Market(
+            market_id="trigger-missing-category",
+            title="Will the Boston Celtics win the NBA Eastern Conference Finals?",
+            description="Sports trigger category fallback test",
+            category=None,
+            market_status="active",
+            is_active=True,
+            slug="will-the-boston-celtics-win-the-nba-eastern-conference-finals",
+        )
+        session.add(market)
+        await session.flush()
+
+        trigger = TriggerEvent(
+            market_id=market.id,
+            trigger_class="liquidity",
+            trigger_level="B",
+            data_source="live",
+            reason="Depth increased 44.3%",
+            triggered_at=datetime.now(tz=UTC),
+        )
+        session.add(trigger)
+        await session.flush()
+
+        service = DashboardService(session=session)
+        events = await service.get_trigger_events(limit=1)
+
+        assert len(events) == 1
+        assert events[0].category == "sports"
+
+    async def test_get_trigger_events_overrides_bad_stored_category(
+        self, session: AsyncSession
+    ):
+        """Trigger events prefer deterministic title/slug inference over bad stored category."""
+        market = Market(
+            market_id="trigger-bad-category",
+            title="Will Shai Gilgeous-Alexander win the 2025–2026 NBA MVP?",
+            description="Sports trigger category correction test",
+            category="technology",
+            market_status="active",
+            is_active=True,
+            slug="will-shai-gilgeous-alexander-win-the-20252026-nba-mvp",
+        )
+        session.add(market)
+        await session.flush()
+
+        trigger = TriggerEvent(
+            market_id=market.id,
+            trigger_class="liquidity",
+            trigger_level="B",
+            data_source="live",
+            reason="Depth increased 50.3%",
+            triggered_at=datetime.now(tz=UTC),
+        )
+        session.add(trigger)
+        await session.flush()
+
+        service = DashboardService(session=session)
+        events = await service.get_trigger_events(limit=1)
+
+        assert len(events) == 1
+        assert events[0].category == "sports"
+
     async def test_get_workflow_runs(self, trigger_session):
         """Workflow runs are returned with correct fields."""
         session, _, _, wf = trigger_session

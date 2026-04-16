@@ -7,6 +7,7 @@ layer stays thin.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -15,6 +16,7 @@ import structlog
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from eligibility.category_classifier import classify_category
 from dashboard_api.schemas import (
     AbsenceStatus,
     AgentStatus,
@@ -49,6 +51,14 @@ from dashboard_api.schemas import (
 )
 
 _log = structlog.get_logger(component="dashboard_service")
+_TRIGGER_SPORTS_HINT = re.compile(
+    r"\b(?:"
+    r"nba|nfl|mlb|nhl|ufc|mma|ipl|mvp|rookie of the year|premier league|"
+    r"champions league|la liga|bundesliga|serie a|ligue 1|mls|world cup|"
+    r"super bowl|stanley cup|world series|conference finals|playoffs?|finals?"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 class DashboardService:
@@ -72,6 +82,57 @@ class DashboardService:
             "system_status": "running",
             "agents_running": False,
         }
+
+    @staticmethod
+    def _normalize_market_tags(tags: Any) -> list[str]:
+        """Normalize stored market tags into a classifier-friendly list."""
+        if not tags:
+            return []
+        if isinstance(tags, list):
+            return [str(tag) for tag in tags if tag is not None]
+        if isinstance(tags, dict):
+            return [str(value) for value in tags.values() if value is not None]
+        if isinstance(tags, (set, tuple)):
+            return [str(tag) for tag in tags if tag is not None]
+        return [str(tags)]
+
+    @staticmethod
+    def _has_explicit_sports_marker(
+        market_title: str | None,
+        slug: str | None,
+    ) -> bool:
+        """Detect common sports trigger phrasing without substring false positives."""
+        for value in (market_title, slug.replace("-", " ") if slug else None):
+            if value and _TRIGGER_SPORTS_HINT.search(value):
+                return True
+        return False
+
+    @classmethod
+    def _resolve_trigger_category(
+        cls,
+        *,
+        category: str | None,
+        market_title: str | None,
+        tags: Any = None,
+        slug: str | None = None,
+    ) -> str | None:
+        """Return the best deterministic category for trigger display."""
+        if cls._has_explicit_sports_marker(market_title, slug):
+            return "sports"
+
+        stored_category: str | None = None
+        if isinstance(category, str):
+            normalized = category.strip().lower()
+            if normalized and normalized != "unknown":
+                stored_category = normalized
+
+        inferred = classify_category(
+            raw_category=None,
+            tags=cls._normalize_market_tags(tags),
+            slug=slug,
+            title=market_title or "",
+        )
+        return inferred.category or stored_category
 
     # ─── Portfolio Overview ───────────────────────────
 
@@ -586,7 +647,14 @@ class DashboardService:
         from data.models.workflow import TriggerEvent
 
         query = (
-            select(TriggerEvent, Market.title, Market.market_id, Market.category)
+            select(
+                TriggerEvent,
+                Market.title,
+                Market.market_id,
+                Market.category,
+                Market.tags,
+                Market.slug,
+            )
             .join(Market, TriggerEvent.market_id == Market.id)
             .order_by(TriggerEvent.triggered_at.desc())
             .limit(limit)
@@ -603,14 +671,19 @@ class DashboardService:
                     trigger_level=evt.trigger_level,
                     market_id=market_id,
                     market_title=title,
-                    category=category,
+                    category=self._resolve_trigger_category(
+                        category=category,
+                        market_title=title,
+                        tags=tags,
+                        slug=slug,
+                    ),
                     reason=evt.reason,
                     price=evt.price_at_trigger,
                     spread=evt.spread_at_trigger,
                     data_source=evt.data_source,
                     timestamp=evt.triggered_at,
                 )
-                for evt, title, market_id, category in rows
+                for evt, title, market_id, category, tags, slug in rows
             ]
 
         import uuid as _uuid
@@ -627,7 +700,12 @@ class DashboardService:
                 trigger_level=e["trigger_level"],
                 market_id=e.get("market_id"),
                 market_title=e.get("market_title"),
-                category=e.get("category"),
+                category=self._resolve_trigger_category(
+                    category=e.get("category"),
+                    market_title=e.get("market_title"),
+                    tags=e.get("tags"),
+                    slug=e.get("slug"),
+                ),
                 reason=e.get("reason"),
                 price=e.get("price"),
                 spread=e.get("spread"),
