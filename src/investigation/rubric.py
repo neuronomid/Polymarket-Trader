@@ -26,9 +26,9 @@ _log = structlog.get_logger(component="candidate_rubric")
 # NOTE: Thresholds are calibrated for paper/shadow mode where no historical
 # calibration data exists and gross_edge estimates are preliminary.
 # In live mode with calibration data these should be raised back toward 0.25/0.35.
-MIN_COMPOSITE_FOR_OPUS = 0.30  # Must exceed this for Tier A escalation (was 0.35)
-MIN_COMPOSITE_FOR_ACCEPTANCE = 0.15  # Below this → automatic no-trade (was 0.25)
-STRONG_CANDIDATE_THRESHOLD = 0.50  # Above this → high-quality candidate (was 0.55)
+MIN_COMPOSITE_FOR_OPUS = 0.20  # Must exceed this for Tier A escalation (was 0.30)
+MIN_COMPOSITE_FOR_ACCEPTANCE = 0.06  # Below this → automatic no-trade (was 0.15)
+STRONG_CANDIDATE_THRESHOLD = 0.40  # Above this → high-quality candidate (was 0.50)
 
 
 class CandidateRubric:

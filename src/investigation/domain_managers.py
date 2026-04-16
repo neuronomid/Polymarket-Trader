@@ -77,8 +77,14 @@ class BaseDomainManager(BaseAgent):
 
         Subclasses may override to add domain-specific instructions.
         """
+        from datetime import UTC, datetime as _dt
+        current_date = _dt.now(tz=UTC).strftime("%B %d, %Y")
+
         parts = [
             "Analyze this market candidate and produce a structured domain assessment.",
+            "",
+            f"IMPORTANT: Today's date is {current_date}. Reason about events relative to this date,",
+            "not relative to your training data cutoff. This market is CURRENTLY ACTIVE on Polymarket.",
             "",
             f"Market: {candidate.get('title', 'Unknown')}",
             f"Category: {candidate.get('category', 'Unknown')}",
@@ -88,13 +94,23 @@ class BaseDomainManager(BaseAgent):
             f"Visible Depth: ${candidate.get('visible_depth_usd', 0):.0f}",
             f"Resolution Source: {candidate.get('resolution_source', 'N/A')}",
             "",
+            "Your primary task is to estimate the true probability this market resolves YES.",
+            "Provide your best probability estimate even under uncertainty — a range or uncertain estimate",
+            "is more useful than refusing to estimate. The quantitative system will handle edge/risk decisions.",
+            "",
+            "Set recommended_proceed=true unless there is a SPECIFIC STRUCTURAL BARRIER such as:",
+            "  - the market has already resolved",
+            "  - the resolution criteria are fundamentally unanswerable",
+            "  - the market question is based on a false premise",
+            "Uncertainty, market efficiency, or low confidence are NOT reasons to set recommended_proceed=false.",
+            "",
             "Respond with a JSON object containing:",
             '  "summary": brief analysis summary,',
             '  "key_findings": [list of key findings],',
-            '  "concerns": [list of concerns],',
-            '  "recommended_proceed": true/false,',
-            '  "estimated_probability": 0.0-1.0 (your best estimate of the true probability this resolves YES, given your analysis),',
-            '  "probability_direction": "overpriced"|"underpriced"|"fair" (is the current market price too high, too low, or approximately correct),',
+            '  "concerns": [list of concerns or risks],',
+            '  "recommended_proceed": true/false (default true unless specific structural barrier),',
+            '  "estimated_probability": 0.0-1.0 (REQUIRED: your best estimate of the true YES probability),',
+            '  "probability_direction": "overpriced"|"underpriced"|"fair" (vs current market price),',
             '  "optional_agents": [list of optional agents to invoke, if justified],',
             '  "optional_agents_justification": "reason for optional agents",',
             '  "confidence_level": "low"|"medium"|"high",',
@@ -228,14 +244,15 @@ class SportsDomainManager(BaseDomainManager):
         base = super()._build_domain_prompt(candidate, regime)
         domain_context = """
 
-DOMAIN: SPORTS (Quality-Gated Tier)
+DOMAIN: SPORTS
 Focus your analysis on:
-- Resolution is fully objective (win/loss, final score)
-- Verify this is NOT primarily a statistical modeling problem
-- Credible evidential basis beyond public statistics
-- Apply ELEVATED CONSERVATISM per quality gate
-- Flag markets that are purely data-driven (model-dominated)
-- Assess whether the system could realistically have an information edge
+- Whether resolution is fully objective (win/loss, final score, standings)
+- Whether there is identifiable information asymmetry (injuries, lineup news, form, venue factors)
+- Recent form, head-to-head history, and situational edges
+- Resolution source reliability and timeline clarity
+- For long-term markets (championships): consider market efficiency gaps from narrative bias
+Always provide your best estimated_probability based on available information.
+Proceed unless the market has already resolved or the resolution criteria are fundamentally unclear.
 """
         return base + domain_context
 
@@ -308,12 +325,13 @@ class MacroPolicyDomainManager(BaseDomainManager):
 
 DOMAIN: MACRO/POLICY
 Focus your analysis on:
-- Central bank communication and forward guidance
+- Central bank communication and forward guidance signals
 - Legislative calendar and procedural requirements
 - Economic indicator patterns and historical distributions
-- Policy precedent and institutional behavior
-- Market efficiency for major economic releases (typically HIGH)
-- Flag heavily covered macro events where mispricing is unlikely
+- Policy precedent and institutional behavior patterns
+- Whether the market price appears to reflect all public information correctly
+- Identify any specific factors that might cause mispricing (data surprises, political shocks, timing gaps)
+Always provide your best estimated_probability. Proceed unless the resolution criteria are unanswerable.
 """
         return base + domain_context
 

@@ -49,8 +49,11 @@ class EvidenceResearchAgent(BaseAgent):
         result = AgentResult(agent_role=self.role_name)
         candidate = agent_input.context.get("candidate", {})
 
+        from datetime import UTC as _UTC, datetime as _dt
+        current_date = _dt.now(tz=_UTC).strftime("%B %d, %Y")
+
         user_prompt = (
-            "Extract, compress, and structure evidence from the following market context.\n\n"
+            f"Today's date is {current_date}. Extract, compress, and structure evidence from the following market context.\n\n"
             f"Market: {candidate.get('title', 'Unknown')}\n"
             f"Description: {candidate.get('description', 'N/A')}\n"
             f"Category: {candidate.get('category', 'Unknown')}\n"
@@ -117,7 +120,11 @@ class CounterCaseAgent(BaseAgent):
         evidence = agent_input.context.get("evidence", [])
         domain_memo = agent_input.context.get("domain_memo", {})
 
+        from datetime import UTC as _UTC, datetime as _dt
+        current_date = _dt.now(tz=_UTC).strftime("%B %d, %Y")
+
         user_prompt = (
+            f"Today's date is {current_date}. Reason about all events relative to this date.\n\n"
             "Construct the strongest structured case AGAINST the following thesis.\n\n"
             f"Market: {candidate.get('title', 'Unknown')}\n"
             f"Category: {candidate.get('category', 'Unknown')}\n"
@@ -170,7 +177,11 @@ class ResolutionReviewAgent(BaseAgent):
         result = AgentResult(agent_role=self.role_name)
         candidate = agent_input.context.get("candidate", {})
 
+        from datetime import UTC as _UTC, datetime as _dt
+        current_date = _dt.now(tz=_UTC).strftime("%B %d, %Y")
+
         user_prompt = (
+            f"Today's date is {current_date}. Reason about all events and deadlines relative to this date.\n\n"
             "Review the resolution language for this contract.\n\n"
             f"Market: {candidate.get('title', 'Unknown')}\n"
             f"Description: {candidate.get('description', 'N/A')}\n"
@@ -220,7 +231,11 @@ class TimingCatalystAgent(BaseAgent):
         result = AgentResult(agent_role=self.role_name)
         candidate = agent_input.context.get("candidate", {})
 
+        from datetime import UTC as _UTC, datetime as _dt
+        current_date = _dt.now(tz=_UTC).strftime("%B %d, %Y")
+
         user_prompt = (
+            f"Today's date is {current_date}. Reason about all timelines and catalysts relative to this date.\n\n"
             "Assess the timing and catalyst profile for this market.\n\n"
             f"Market: {candidate.get('title', 'Unknown')}\n"
             f"Category: {candidate.get('category', 'Unknown')}\n"
@@ -273,7 +288,11 @@ class MarketStructureAgent(BaseAgent):
 
         # Tier C: Generate narrative summary
         result = AgentResult(agent_role=self.role_name)
+        from datetime import UTC as _UTC, datetime as _dt
+        current_date = _dt.now(tz=_UTC).strftime("%B %d, %Y")
+
         user_prompt = (
+            f"Today's date is {current_date}.\n\n"
             "Describe what the following market structure metrics mean for tradability.\n\n"
             f"Market: {candidate.get('title', 'Unknown')}\n"
             f"Metrics:\n{json.dumps(metrics, indent=2)}\n\n"

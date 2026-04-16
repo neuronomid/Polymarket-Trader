@@ -114,8 +114,8 @@ class InvestigationOrchestrator:
         entry_impact_calculator: EntryImpactCalculator | None = None,
         rubric: CandidateRubric | None = None,
         thesis_builder: ThesisCardBuilder | None = None,
-        min_net_edge: float = 0.02,
-        max_entry_impact_edge_fraction: float = 0.25,
+        min_net_edge: float = 0.008,
+        max_entry_impact_edge_fraction: float = 0.50,
     ) -> None:
         self._router = router
         self._cost_governor = cost_governor
@@ -1165,13 +1165,13 @@ class InvestigationOrchestrator:
         # Priority 1: Direct LLM probability estimate
         if (
             domain_memo.estimated_probability is not None
-            and 0.05 <= domain_memo.estimated_probability <= 0.95
+            and 0.02 <= domain_memo.estimated_probability <= 0.98
         ):
             return domain_memo.estimated_probability
 
         # Priority 2: Direction-aware confidence adjustment
-        confidence_map = {"high": 0.15, "medium": 0.08, "low": 0.04}
-        adjustment = confidence_map.get(domain_memo.confidence_level, 0.04)
+        confidence_map = {"high": 0.20, "medium": 0.12, "low": 0.06}
+        adjustment = confidence_map.get(domain_memo.confidence_level, 0.06)
 
         if domain_memo.probability_direction == "overpriced":
             return max(0.05, market_implied - adjustment)
@@ -1182,8 +1182,8 @@ class InvestigationOrchestrator:
         if domain_memo.recommended_proceed:
             return min(0.95, max(0.05, market_implied + adjustment))
 
-        # Priority 4: Small exploratory offset so downstream checks can evaluate
-        return min(0.95, max(0.05, market_implied + 0.02))
+        # Priority 4: Exploratory offset so downstream edge checks can evaluate
+        return min(0.95, max(0.05, market_implied + 0.06))
 
 
 class _OrchestratorAgent(BaseAgent):
@@ -1218,8 +1218,12 @@ class _OrchestratorAgent(BaseAgent):
         gross_edge = net_edge_data.get('gross_edge', 0)
         impact_adj_edge = net_edge_data.get('impact_adjusted_edge', 0)
 
+        from datetime import UTC as _UTC, datetime as _dt
+        current_date = _dt.now(tz=_UTC).strftime("%B %d, %Y")
+
         user_prompt = (
             "Perform final synthesis for this investigated market candidate.\n\n"
+            f"IMPORTANT: Today's date is {current_date}. Reason about all events relative to this date.\n\n"
             f"Market: {ctx.get('candidate', {}).get('title', 'Unknown')}\n"
             f"Category: {ctx.get('candidate', {}).get('category', 'Unknown')}\n\n"
             f"Domain Analysis Summary:\n{ctx.get('domain_memo', {}).get('summary', 'N/A')}\n"
@@ -1233,17 +1237,23 @@ class _OrchestratorAgent(BaseAgent):
             f"Entry Impact: {ctx.get('entry_impact_bps', 0):.1f} bps\n"
             f"Base Rate: {ctx.get('base_rate', {}).get('base_rate', 0.5)}\n"
             f"Rubric Score: {rubric_score:.3f} (passed threshold)\n\n"
-            "This candidate has already passed deterministic screening (rubric, edge, impact checks). "
-            "Your role is to assess whether the thesis is well-grounded and the edge is genuine.\n\n"
+            "This candidate passed all deterministic screening (rubric, edge, impact checks). "
+            "Synthesize the research into a structured trade thesis. Your job is to BUILD the best "
+            "thesis you can from the available evidence, not to re-evaluate the edge.\n\n"
+            "Only respond with no_trade if there is a SPECIFIC STRUCTURAL BARRIER such as: "
+            "the market has already resolved, the resolution criteria are fundamentally unanswerable, "
+            "the proposed side is clearly backwards, or there is an outright factual error in the analysis.\n\n"
+            "Otherwise, build the thesis and accept. Uncertainty alone is NOT a reason to decline — "
+            "all prediction markets carry uncertainty.\n\n"
             "Respond with ONLY a raw JSON object (no markdown, no code blocks):\n"
-            'If the evidence supports a genuine edge: {"decision": "accept", "proposed_side": "yes" or "no", '
+            'If building the thesis: {"decision": "accept", "proposed_side": "yes" or "no", '
             '"core_thesis": "...", "why_mispriced": "...", '
             '"probability_estimate": 0.0-1.0, "confidence_estimate": 0.0-1.0, '
             '"calibration_confidence": 0.0-1.0, "confidence_note": "...", '
             '"invalidation_conditions": ["..."], '
             '"supporting_evidence": [...], "opposing_evidence": [...], '
             '"resolution_risk_summary": "..."}\n'
-            'If the evidence does NOT support a genuine edge: {"decision": "no_trade", "no_trade_reason": "..."}'
+            'If there is a specific structural barrier: {"decision": "no_trade", "no_trade_reason": "..."}'
         )
 
         response = await self.call_llm(

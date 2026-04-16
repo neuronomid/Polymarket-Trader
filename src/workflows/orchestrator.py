@@ -1119,6 +1119,13 @@ class WorkflowOrchestrator:
             # Collect (market_id_str, elig_result) pairs for DB persistence
             _elig_decisions_to_persist: list[tuple[str, Any]] = []
             for market in markets_filtered[:50]:  # cap to prevent overload
+                # Skip markets with no usable title — Gamma API returned incomplete metadata.
+                # Category classification cannot work without a title, so these would only
+                # produce "unknown_category" rejections and pollute the DB with market_id as title.
+                if not market.title or not market.title.strip():
+                    _log.debug("sweep_skip_no_title", market_id=market.market_id)
+                    continue
+
                 elig_input = MarketEligibilityInput(
                     market_id=market.market_id or str(uuid.uuid4()),
                     title=market.title or "",
@@ -1159,10 +1166,15 @@ class WorkflowOrchestrator:
                         )
                     # Only INVESTIGATE_NOW markets become active investigation candidates.
                     if result.outcome == EligibilityOutcome.INVESTIGATE_NOW.value:
-                        # Skip near-certainty markets — no exploitable edge.
                         # MarketInfo from discovery has no real-time price; use getattr safely.
                         market_price = getattr(market, 'price', None) or getattr(market, 'mid_price', None)
-                        if market_price is not None and (market_price < 0.04 or market_price > 0.96):
+                        # Skip markets with no price data — can't compute edge without it.
+                        # The trigger-based path will catch these later with real CLOB prices.
+                        if market_price is None:
+                            _log.debug("sweep_skip_no_price", market_id=elig_input.market_id)
+                            continue
+                        # Skip near-certainty markets — no exploitable edge.
+                        if market_price < 0.04 or market_price > 0.96:
                             continue
                         eligible_candidates.append(
                             CandidateContext(
