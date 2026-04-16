@@ -85,6 +85,14 @@ from market_data.types import OrderBookLevel
 
 _log = structlog.get_logger(component="investigation_orchestrator")
 
+STRUCTURAL_PROCEED_BLOCKERS = {
+    "resolved",
+    "unanswerable_resolution",
+    "false_premise",
+    "backward_side",
+    "factual_error",
+}
+
 
 class InvestigationOrchestrator:
     """Orchestrates the full investigation workflow.
@@ -391,12 +399,18 @@ class InvestigationOrchestrator:
             )
 
         if not domain_memo.recommended_proceed:
+            market_implied = candidate.mid_price or candidate.price or 0.5
+            estimated_probability = self._estimate_probability_from_domain(
+                domain_memo,
+                market_implied,
+            )
             _log.info(
                 "candidate_rejected_no_proceed",
                 market_id=candidate.market_id,
                 title=candidate.title[:60] if candidate.title else "",
                 category=candidate.category,
                 confidence_level=domain_memo.confidence_level,
+                proceed_blocker_code=domain_memo.proceed_blocker_code,
                 concerns=domain_memo.concerns[:3] if domain_memo.concerns else [],
                 summary=domain_memo.summary[:120] if domain_memo.summary else "",
             )
@@ -412,6 +426,9 @@ class InvestigationOrchestrator:
                     reason_detail=domain_memo.summary or None,
                     quantitative_context={
                         "confidence_level": domain_memo.confidence_level,
+                        "estimated_probability": estimated_probability,
+                        "proceed_blocker_code": domain_memo.proceed_blocker_code,
+                        "proceed_blocker_detail": domain_memo.proceed_blocker_detail,
                         "concerns": domain_memo.concerns[:5],
                     },
                 ),
@@ -505,6 +522,7 @@ class InvestigationOrchestrator:
                     quantitative_context={
                         "composite_score": rubric_score.composite_score,
                         "threshold": MIN_COMPOSITE_FOR_ACCEPTANCE,
+                        "estimated_probability": domain_prob,
                         "gross_edge": gross_edge,
                     },
                     rubric_score=rubric_score,
@@ -549,11 +567,13 @@ class InvestigationOrchestrator:
                         f"did not exceed minimum {self._min_net_edge:.6f}"
                     ),
                     quantitative_context={
+                        "estimated_probability": domain_prob,
                         "gross_edge": net_edge.gross_edge,
                         "friction_adjusted_edge": net_edge.friction_adjusted_edge,
                         "impact_adjusted_edge": net_edge.impact_adjusted_edge,
                         "net_edge_after_cost": net_edge.net_edge_after_cost,
                         "min_viable_edge": self._min_net_edge,
+                        "composite_score": rubric_score.composite_score,
                     },
                     rubric_score=rubric_score,
                 ),
@@ -589,7 +609,9 @@ class InvestigationOrchestrator:
                             "impact_fraction": impact_fraction,
                             "max_impact_fraction": self._max_impact_fraction,
                             "estimated_impact_bps": entry_impact.estimated_impact_bps,
+                            "estimated_probability": domain_prob,
                             "gross_edge": gross_edge,
+                            "composite_score": rubric_score.composite_score,
                         },
                         rubric_score=rubric_score,
                     ),
@@ -626,8 +648,10 @@ class InvestigationOrchestrator:
                     stage="orchestrator_synthesis",
                     reason_detail="Final orchestration output was unavailable.",
                     quantitative_context={
+                        "estimated_probability": domain_prob,
                         "gross_edge": net_edge.gross_edge,
                         "impact_adjusted_edge": net_edge.impact_adjusted_edge,
+                        "composite_score": rubric_score.composite_score,
                     },
                 ),
                 cost_spent_usd=candidate_cost_spent,
@@ -651,9 +675,15 @@ class InvestigationOrchestrator:
                     stage="orchestrator_synthesis",
                     reason_detail=orchestrator_output.get("no_trade_reason"),
                     quantitative_context={
+                        "estimated_probability": (
+                            orchestrator_output.get("probability_estimate")
+                            if orchestrator_output is not None
+                            else domain_prob
+                        ),
                         "gross_edge": net_edge.gross_edge,
                         "impact_adjusted_edge": net_edge.impact_adjusted_edge,
                         "net_edge_after_cost": net_edge.net_edge_after_cost,
+                        "composite_score": rubric_score.composite_score,
                     },
                     rubric_score=rubric_score,
                 ),
@@ -683,6 +713,11 @@ class InvestigationOrchestrator:
             reason="Candidate accepted",
             reason_code="candidate_accepted",
             quantitative_context={
+                "estimated_probability": (
+                    orchestrator_output.get("probability_estimate")
+                    if orchestrator_output is not None
+                    else domain_prob
+                ),
                 "gross_edge": net_edge.gross_edge,
                 "impact_adjusted_edge": net_edge.impact_adjusted_edge,
                 "net_edge_after_cost": net_edge.net_edge_after_cost,
@@ -720,6 +755,43 @@ class InvestigationOrchestrator:
             cost_spent_usd=no_trade.cost_spent_usd,
             no_trade_result=no_trade,
         )
+
+    def _normalize_domain_memo(
+        self,
+        candidate: CandidateContext,
+        memo: DomainMemo,
+    ) -> DomainMemo:
+        """Normalize non-structural domain rejects into proceed-with-caution memos."""
+        blocker_code = (memo.proceed_blocker_code or "").strip().lower() or None
+        if memo.recommended_proceed or blocker_code in STRUCTURAL_PROCEED_BLOCKERS:
+            return memo
+
+        concerns = list(memo.concerns)
+        if memo.proceed_blocker_detail:
+            concerns.append(f"Original blocker detail: {memo.proceed_blocker_detail}")
+
+        domain_specific = dict(memo.domain_specific_data or {})
+        domain_specific.update({
+            "normalized_non_structural_reject": True,
+            "original_recommended_proceed": memo.recommended_proceed,
+            "original_proceed_blocker_code": memo.proceed_blocker_code,
+            "original_proceed_blocker_detail": memo.proceed_blocker_detail,
+        })
+
+        _log.info(
+            "domain_manager_reject_normalized",
+            market_id=candidate.market_id,
+            category=candidate.category,
+            blocker_code=memo.proceed_blocker_code,
+            confidence_level=memo.confidence_level,
+        )
+
+        return memo.model_copy(update={
+            "recommended_proceed": True,
+            "confidence_level": "low",
+            "concerns": concerns[:8],
+            "domain_specific_data": domain_specific,
+        })
 
     def _validate_candidate_metadata(
         self,
@@ -793,7 +865,8 @@ class InvestigationOrchestrator:
         cost = result.total_cost_usd if result.success else 0.0
 
         if result.success and result.result:
-            return DomainMemo(**result.result), manager.role_name, cost
+            memo = DomainMemo(**result.result)
+            return self._normalize_domain_memo(candidate, memo), manager.role_name, cost
         return None, manager.role_name, cost
 
     async def _run_research_pack(
@@ -1183,7 +1256,7 @@ class InvestigationOrchestrator:
             return min(0.95, max(0.05, market_implied + adjustment))
 
         # Priority 4: Exploratory offset so downstream edge checks can evaluate
-        return min(0.95, max(0.05, market_implied + 0.06))
+        return min(0.95, max(0.05, market_implied + 0.02))
 
 
 class _OrchestratorAgent(BaseAgent):

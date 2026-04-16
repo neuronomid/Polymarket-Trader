@@ -54,7 +54,12 @@ _log = structlog.get_logger(component="dashboard_api")
 _STATE_FILE = Path("data") / "system_state.json"
 
 # Keys that are persisted to disk so they survive restarts
-_PERSISTED_KEYS = ("operator_mode", "paper_balance_usd", "start_of_day_equity_usd")
+_PERSISTED_KEYS = (
+    "operator_mode",
+    "paper_balance_usd",
+    "start_of_day_equity_usd",
+    "paper_transactions",
+)
 
 
 def _load_persisted_state() -> dict[str, Any]:
@@ -113,8 +118,9 @@ _system_state: dict[str, Any] = {
     # Paper balance tracking
     "paper_balance_usd": _persisted.get("paper_balance_usd", 500.0),
     "paper_equity_usd": _persisted.get("paper_balance_usd", 500.0),
+    "paper_reserved_capital_usd": 0.0,
     "start_of_day_equity_usd": _persisted.get("start_of_day_equity_usd", 500.0),
-    "paper_transactions": [],
+    "paper_transactions": _persisted.get("paper_transactions", []),
     # Activity log (circular buffer, last 200 events)
     "activity_log": [],
     # Live pipeline data (circular buffers, never written to DB from orchestrator)
@@ -665,6 +671,7 @@ def _add_trigger_event(
     spread: float | None = None,
     data_source: str | None = "live",
     market_title: str | None = None,
+    category: str | None = None,
 ) -> None:
     """Record a scanner trigger event in the in-memory store."""
     import uuid as _uuid
@@ -674,6 +681,7 @@ def _add_trigger_event(
         "trigger_level": trigger_level,
         "market_id": market_id,
         "market_title": market_title,
+        "category": category,
         "reason": reason,
         "price": price,
         "spread": spread,

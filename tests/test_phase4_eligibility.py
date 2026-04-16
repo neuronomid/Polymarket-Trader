@@ -170,6 +170,21 @@ class TestCategoryClassifier:
         result = classify_category(title="Will the Federal Reserve cut interest rates?")
         assert result.category == "macro_policy"
 
+    def test_sports_title_override_handles_team_win_form(self):
+        result = classify_category(title="Will Liverpool FC win on 2026-04-19?")
+        assert result.category == "sports"
+        assert result.classification_method == "title_override"
+
+    def test_sports_title_override_handles_league_outright(self):
+        result = classify_category(title="Premier League winner 2026")
+        assert result.category == "sports"
+        assert result.classification_method == "title_override"
+
+    def test_geopolitics_title_override_handles_iran_military_market(self):
+        result = classify_category(title="Will Iran retaliate with military strikes against Israel?")
+        assert result.category == "geopolitics"
+        assert result.classification_method == "title_override"
+
     # --- Priority ordering ---
 
     def test_api_category_takes_priority(self):

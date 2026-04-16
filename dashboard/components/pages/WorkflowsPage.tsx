@@ -36,6 +36,14 @@ function formatEventTime(value: string | null): string {
   });
 }
 
+function formatCategory(value: string | null): string {
+  if (!value) return "—";
+
+  return value
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
 export function WorkflowsPage({ workflows, triggers }: { workflows: WorkflowRunSummary[]; triggers: TriggerEventItem[] }) {
   const recentWorkflows = [...workflows]
     .sort((left, right) => toTimestamp(right.completed_at ?? right.started_at) - toTimestamp(left.completed_at ?? left.started_at))
@@ -106,7 +114,7 @@ export function WorkflowsPage({ workflows, triggers }: { workflows: WorkflowRunS
             <Zap size={14} color="var(--yellow)" />
           </div>
           <table className="data-table">
-            <thead><tr><th>Time</th><th>Level</th><th>Class</th><th>Market</th><th>Reason</th><th>Source</th></tr></thead>
+            <thead><tr><th>Time</th><th>Level</th><th>Class</th><th>Market</th><th>Category</th><th>Reason</th><th>Source</th></tr></thead>
             <tbody>
               {recentTriggers.map((t) => (
                 <tr key={t.id}>
@@ -119,10 +127,15 @@ export function WorkflowsPage({ workflows, triggers }: { workflows: WorkflowRunS
                     </span>
                   </td>
                   <td style={{ fontSize: "0.72rem" }}>{t.trigger_class.replace(/_/g, " ")}</td>
-                  <td style={{ maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  <td style={{ maxWidth: 150, overflow: "hidden", textOverflow: "ellipsis" }}>
                     {t.market_title || t.market_id || "—"}
                   </td>
-                  <td style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", color: "var(--text-dim)" }}>
+                  <td>
+                    <span className="badge muted" style={{ fontSize: "0.6rem" }}>
+                      {formatCategory(t.category)}
+                    </span>
+                  </td>
+                  <td style={{ maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", color: "var(--text-dim)" }}>
                     {t.reason}
                   </td>
                   <td><span className={`badge ${t.data_source === "live" ? "green" : "yellow"}`}>{t.data_source}</span></td>

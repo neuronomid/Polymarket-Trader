@@ -42,6 +42,7 @@ class PortfolioOverview(BaseModel):
     total_equity_usd: float = 0.0
     paper_cash_balance_usd: float = 0.0
     paper_equity_usd: float = 0.0
+    paper_reserved_capital_usd: float = 0.0
     total_open_exposure_usd: float = 0.0
     daily_pnl_usd: float = 0.0
     unrealized_pnl_usd: float = 0.0
@@ -234,6 +235,7 @@ class TriggerEventItem(BaseModel):
     trigger_level: str
     market_id: str | None = None
     market_title: str | None = None
+    category: str | None = None
     reason: str | None = None
     price: float | None = None
     spread: float | None = None

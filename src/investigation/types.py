@@ -219,6 +219,8 @@ class DomainMemo(BaseModel):
     key_findings: list[str] = Field(default_factory=list)
     concerns: list[str] = Field(default_factory=list)
     recommended_proceed: bool = False
+    proceed_blocker_code: str | None = None
+    proceed_blocker_detail: str | None = None
     optional_agents_justified: list[str] = Field(default_factory=list)
     optional_agents_justification: str | None = None
     confidence_level: str = "low"  # low, medium, high

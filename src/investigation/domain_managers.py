@@ -102,13 +102,20 @@ class BaseDomainManager(BaseAgent):
             "  - the market has already resolved",
             "  - the resolution criteria are fundamentally unanswerable",
             "  - the market question is based on a false premise",
+            "  - the proposed side is clearly backwards",
+            "  - there is a factual error that invalidates the setup",
             "Uncertainty, market efficiency, or low confidence are NOT reasons to set recommended_proceed=false.",
+            'If recommended_proceed=false, you MUST include "proceed_blocker_code" with one of:',
+            '  "resolved", "unanswerable_resolution", "false_premise", "backward_side", "factual_error"',
+            'and "proceed_blocker_detail" describing the blocker.',
             "",
             "Respond with a JSON object containing:",
             '  "summary": brief analysis summary,',
             '  "key_findings": [list of key findings],',
             '  "concerns": [list of concerns or risks],',
             '  "recommended_proceed": true/false (default true unless specific structural barrier),',
+            '  "proceed_blocker_code": null or one of the allowed blocker codes,',
+            '  "proceed_blocker_detail": null or blocker explanation,',
             '  "estimated_probability": 0.0-1.0 (REQUIRED: your best estimate of the true YES probability),',
             '  "probability_direction": "overpriced"|"underpriced"|"fair" (vs current market price),',
             '  "optional_agents": [list of optional agents to invoke, if justified],',
@@ -143,6 +150,10 @@ class BaseDomainManager(BaseAgent):
             data.setdefault("summary", content[:500])
             data.setdefault("recommended_proceed", True)
 
+        data.setdefault("recommended_proceed", True)
+        data.setdefault("proceed_blocker_code", None)
+        data.setdefault("proceed_blocker_detail", None)
+
         # Parse and validate estimated_probability
         raw_prob = data.get("estimated_probability")
         estimated_prob = None
@@ -167,6 +178,8 @@ class BaseDomainManager(BaseAgent):
             key_findings=data.get("key_findings", []),
             concerns=data.get("concerns", []),
             recommended_proceed=data.get("recommended_proceed", False),
+            proceed_blocker_code=data.get("proceed_blocker_code"),
+            proceed_blocker_detail=data.get("proceed_blocker_detail"),
             optional_agents_justified=data.get("optional_agents", []),
             optional_agents_justification=data.get("optional_agents_justification"),
             confidence_level=data.get("confidence_level", "low"),
@@ -246,12 +259,15 @@ class SportsDomainManager(BaseDomainManager):
 
 DOMAIN: SPORTS
 Focus your analysis on:
+- Sports is a Quality-Gated category with ELEVATED CONSERVATISM for sizing and calibration.
+- Treat that conservatism as a sizing and calibration constraint, not an automatic no-trade barrier.
 - Whether resolution is fully objective (win/loss, final score, standings)
 - Whether there is identifiable information asymmetry (injuries, lineup news, form, venue factors)
 - Recent form, head-to-head history, and situational edges
 - Resolution source reliability and timeline clarity
 - For long-term markets (championships): consider market efficiency gaps from narrative bias
 Always provide your best estimated_probability based on available information.
+Do NOT set recommended_proceed=false merely because calibration is insufficient, confidence is low, or the market may be efficient.
 Proceed unless the market has already resolved or the resolution criteria are fundamentally unclear.
 """
         return base + domain_context

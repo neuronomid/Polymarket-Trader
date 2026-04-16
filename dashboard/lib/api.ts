@@ -128,6 +128,7 @@ export interface TriggerEventItem {
   trigger_level: string;
   market_id: string | null;
   market_title: string | null;
+  category: string | null;
   reason: string | null;
   price: number | null;
   spread: number | null;

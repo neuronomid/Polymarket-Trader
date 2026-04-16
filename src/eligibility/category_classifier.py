@@ -36,6 +36,10 @@ _TITLE_GEOPOLITICS_PATTERNS: list[re.Pattern[str]] = [
         r'\b(?:strike|attack|bomb|invade|weapon|military)\b.*\b(?:iran|ukraine|russia|israel|gaza|hamas|hezbollah|houthis?)\b',
         re.IGNORECASE,
     ),
+    re.compile(
+        r'\b(?:iran|israel|ukraine|russia)\b.*\b(?:retaliat(?:e|ion)|nuclear|troops?|military|missile|strike|attack|drone)\b',
+        re.IGNORECASE,
+    ),
 ]
 
 _TITLE_SPORTS_PATTERNS: list[re.Pattern[str]] = [
@@ -51,6 +55,40 @@ _TITLE_SPORTS_PATTERNS: list[re.Pattern[str]] = [
     ),
     re.compile(
         r'\b(?:end|ends)\s+in\s+a\s+draw\b',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'^will\s+.+\b(?:fc|cf|sc|united|city|club)\b.+\bwin on \d{4}-\d{2}-\d{2}\??$',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\b(?:fc|cf|sc|united|city|arsenal|liverpool|chelsea|barcelona|madrid|lakers|celtics|yankees|dodgers|chiefs|packers)\b.*\b(?:vs\.?|versus)\b',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\b(?:premier league|champions league|la liga|bundesliga|serie a|ligue 1|mls|world cup|super bowl|stanley cup|world series|nba finals?|ipl)\b.*\b(?:winner|champion|championship|title)\b',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\b(?:winner|champion|championship|title)\b.*\b(?:premier league|champions league|la liga|bundesliga|serie a|ligue 1|mls|world cup|super bowl|stanley cup|world series|nba finals?|ipl)\b',
+        re.IGNORECASE,
+    ),
+]
+
+_SLUG_GEOPOLITICS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r'(?:iran|israel|ukraine|russia).*(?:retaliat|nuclear|troops|military|missile|strike|attack|drone)',
+        re.IGNORECASE,
+    ),
+]
+
+_SLUG_SPORTS_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r'will-[a-z0-9-]+-(?:fc|cf|sc|united|city)-win-on-\d{4}-\d{2}-\d{2}',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'(?:premier-league|champions-league|la-liga|bundesliga|serie-a|ligue-1|mls|world-cup|super-bowl|stanley-cup|world-series|nba-finals|ipl).*(?:winner|champion|championship|title)',
         re.IGNORECASE,
     ),
 ]
@@ -436,6 +474,28 @@ def classify_category(
                     is_excluded=True,
                     quality_tier="excluded",
                     confidence=0.85,
+                    classification_method="slug_match",
+                    raw_category=raw_category,
+                )
+        for pattern in _SLUG_GEOPOLITICS_PATTERNS:
+            if pattern.search(norm_slug):
+                tier = CATEGORY_QUALITY_TIERS.get(Category.GEOPOLITICS.value, "standard")
+                return CategoryClassification(
+                    category=Category.GEOPOLITICS.value,
+                    is_excluded=False,
+                    quality_tier=tier,
+                    confidence=0.9,
+                    classification_method="slug_match",
+                    raw_category=raw_category,
+                )
+        for pattern in _SLUG_SPORTS_PATTERNS:
+            if pattern.search(norm_slug):
+                tier = CATEGORY_QUALITY_TIERS.get(Category.SPORTS.value, "standard")
+                return CategoryClassification(
+                    category=Category.SPORTS.value,
+                    is_excluded=False,
+                    quality_tier=tier,
+                    confidence=0.9,
                     classification_method="slug_match",
                     raw_category=raw_category,
                 )

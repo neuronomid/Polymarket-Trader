@@ -71,6 +71,7 @@ class TestSchemas:
     def test_portfolio_overview_defaults(self):
         overview = PortfolioOverview()
         assert overview.total_equity_usd == 0.0
+        assert overview.paper_reserved_capital_usd == 0.0
         assert overview.open_positions_count == 0
         assert overview.drawdown_level == "normal"
         assert overview.operator_mode == "paper"
@@ -80,6 +81,7 @@ class TestSchemas:
     def test_portfolio_overview_populated(self):
         overview = PortfolioOverview(
             total_equity_usd=12345.67,
+            paper_reserved_capital_usd=5000.0,
             total_open_exposure_usd=5000.0,
             daily_pnl_usd=-42.50,
             unrealized_pnl_usd=-60.0,
@@ -91,6 +93,7 @@ class TestSchemas:
             system_status="running",
         )
         assert overview.total_equity_usd == 12345.67
+        assert overview.paper_reserved_capital_usd == 5000.0
         assert overview.daily_pnl_usd == -42.50
         assert overview.drawdown_level == "soft_warning"
         assert overview.operator_mode == "shadow"
@@ -170,10 +173,12 @@ class TestSchemas:
             id=uuid.uuid4(),
             trigger_class="repricing",
             trigger_level="B",
+            category="politics",
             timestamp=datetime.now(tz=UTC),
         )
         assert evt.trigger_class == "repricing"
         assert evt.trigger_level == "B"
+        assert evt.category == "politics"
         assert evt.price is None
 
     def test_cost_metrics_defaults(self):
@@ -390,6 +395,7 @@ class TestDashboardServiceDB:
         overview = await service.get_portfolio_overview()
 
         assert overview.open_positions_count == 2
+        assert overview.paper_reserved_capital_usd == 1400.0
         assert overview.total_open_exposure_usd == 1400.0  # 800 + 600
         assert overview.unrealized_pnl_usd == 94.0  # 64 + 30
         assert overview.realized_pnl_usd == 0.0  # Only open positions
@@ -401,6 +407,7 @@ class TestDashboardServiceDB:
         service = DashboardService(session=session)
         overview = await service.get_portfolio_overview()
         assert overview.open_positions_count == 0
+        assert overview.paper_reserved_capital_usd == 0.0
         assert overview.total_open_exposure_usd == 0.0
         assert overview.unrealized_pnl_usd == 0.0
 
@@ -411,6 +418,7 @@ class TestDashboardServiceDB:
             system_state={
                 "paper_balance_usd": 500.0,
                 "paper_equity_usd": 545.0,
+                "paper_reserved_capital_usd": 120.0,
                 "operator_mode": "paper",
                 "system_status": "running",
                 "equity_history": [],
@@ -418,6 +426,7 @@ class TestDashboardServiceDB:
         )
         overview = await service.get_portfolio_overview()
         assert overview.total_equity_usd == 545.0
+        assert overview.paper_reserved_capital_usd == 120.0
 
     async def test_get_positions_all(self, populated_session):
         """Get all positions returns correct count."""
@@ -805,6 +814,7 @@ class TestDashboardAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert "total_equity_usd" in data
+        assert "paper_reserved_capital_usd" in data
         assert "drawdown_level" in data
         assert "operator_mode" in data
         assert data["operator_mode"] == "paper"
@@ -1212,6 +1222,7 @@ class TestWorkflowAndTriggerDB:
         evt = events[0]
         assert evt.trigger_class == "repricing"
         assert evt.trigger_level == "B"
+        assert evt.category == "politics"
         assert evt.price == 0.55
         assert evt.spread == 0.03
 

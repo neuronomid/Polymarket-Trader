@@ -130,6 +130,9 @@ class DashboardService:
             total_equity_usd=paper_equity,
             paper_cash_balance_usd=paper_cash,
             paper_equity_usd=paper_equity,
+            paper_reserved_capital_usd=float(
+                self._system_state.get("paper_reserved_capital_usd", float(row.exposure))
+            ),
             total_open_exposure_usd=float(row.exposure),
             daily_pnl_usd=float(row.unrealized) + float(row.realized),
             unrealized_pnl_usd=float(row.unrealized),
@@ -583,7 +586,7 @@ class DashboardService:
         from data.models.workflow import TriggerEvent
 
         query = (
-            select(TriggerEvent, Market.title, Market.market_id)
+            select(TriggerEvent, Market.title, Market.market_id, Market.category)
             .join(Market, TriggerEvent.market_id == Market.id)
             .order_by(TriggerEvent.triggered_at.desc())
             .limit(limit)
@@ -600,13 +603,14 @@ class DashboardService:
                     trigger_level=evt.trigger_level,
                     market_id=market_id,
                     market_title=title,
+                    category=category,
                     reason=evt.reason,
                     price=evt.price_at_trigger,
                     spread=evt.spread_at_trigger,
                     data_source=evt.data_source,
                     timestamp=evt.triggered_at,
                 )
-                for evt, title, market_id in rows
+                for evt, title, market_id, category in rows
             ]
 
         import uuid as _uuid
@@ -623,6 +627,7 @@ class DashboardService:
                 trigger_level=e["trigger_level"],
                 market_id=e.get("market_id"),
                 market_title=e.get("market_title"),
+                category=e.get("category"),
                 reason=e.get("reason"),
                 price=e.get("price"),
                 spread=e.get("spread"),

@@ -21,6 +21,10 @@ When you start work here, read in this order:
 4. [docs/Plan.md](docs/Plan.md)
 5. [CLAUDE.md](CLAUDE.md) for extra repo guidance only
 
+If you are editing the frontend under [dashboard](dashboard), also read:
+
+- [dashboard/AGENTS.md](dashboard/AGENTS.md)
+
 `CLAUDE.md` may be read, but do not edit it unless the user explicitly asks. For this repo, assume it is read-only.
 
 If docs and code disagree:
@@ -31,68 +35,122 @@ If docs and code disagree:
 
 ## Current State
 
-As of the current repository snapshot:
+As of April 16, 2026:
 
-- Phases 1 through 8 from [docs/Plan.md](docs/Plan.md) are substantially implemented and tested.
-- The Phase 2 persistence layer is broad and includes the full schema footprint expected by the current tests and initial migration.
-- Later workflow packages mostly exist as scaffolds only.
+- the repository has moved well beyond the old Phase 1-8 baseline
+- phases 1 through 15C from [docs/Plan.md](docs/Plan.md) now have substantial code and test coverage in this repo
+- the current runtime is centered on [src/workflows/orchestrator.py](src/workflows/orchestrator.py), not just disconnected subsystem scaffolds
+- paper and shadow workflows are the most complete operating modes
+- live-mode execution is still not connected to a real exchange adapter
 
 Implemented, tested areas:
 
-- configuration and constants
-- core enums and shared types
-- structured logging
-- SQLAlchemy models, repositories, database helpers, seed data, Alembic bootstrap migration
-- market data clients, cache, fallback service, rate limiting
-- eligibility classifier, hard rules, sports gate, profile scoring, edge scoring, engine
-- scanner types, trigger detection, degraded mode, health monitor, async scanner loop
-- risk drawdown, liquidity sizing, correlation, capital rules, sizer, governor
-- cost estimation, budget tracking, selectivity tracking, review-cost tracking, feedback loop, governor
-- agent registry, prompt manager, provider abstraction, compression, escalation policy, regime adapter, base agent types
+- configuration, core enums, shared types, and structlog setup
+- SQLAlchemy models, repositories, database helpers, seed data, and Alembic bootstrap migration
+- market data clients, cache, fallback service, rate limiting, and watch-list integration
+- eligibility classification, hard rules, sports gate, profile scoring, edge scoring, title/slug overrides, and engine
+- scanner types, trigger detection, degraded mode, health monitor, and async scanner loop
+- risk drawdown, liquidity sizing, correlation, capital rules, sizer, and governor
+- cost estimation, budget tracking, selectivity tracking, review-cost tracking, feedback loop, and governor
+- agent registry, prompt manager, provider routing, compression, escalation policy, regime adaptation, and base agent types
+- investigation orchestration, base-rate system, entry-impact computation, domain managers, proceed-blocker handling, quantitative no-trade context, research agents, rubric scoring, and thesis-card building
+- tradeability resolution parsing and tradeability synthesis
+- deterministic execution engine, friction calibration, and slippage tracking
+- position review scheduling, deterministic-first checks, LLM escalation, exit classification, and paper mark-to-market updates
+- calibration store, Brier computation, segment thresholds, sizing calibration, friction feedback, and accumulation tracking
+- learning loops, category ledger, no-trade monitoring, patience budget, performance review, and policy review
+- bias detection and audit orchestration
+- strategy viability checkpoints and lifetime budget tracking
+- operator absence escalation and wind-down logic
+- notifications event bus, formatting, Telegram delivery, repositories, and service layer
+- FastAPI dashboard API, schemas, dashboard data services, and paper portfolio state persistence
+- workflow scheduler, scheduled sweep ranking, trigger-to-candidate construction, and full-system orchestration
+- Next.js dashboard frontend under [dashboard](dashboard)
 
-Scaffold or mostly empty packages:
+Important current limitations:
 
-- `src/absence`
-- `src/bias`
-- `src/calibration`
-- `src/dashboard_api`
-- `src/execution`
-- `src/investigation`
-- `src/learning`
-- `src/notifications`
-- `src/positions`
-- `src/tradeability`
-- `src/viability`
-- `src/workflows`
-
-Important implication:
-
-- do not describe those packages as implemented subsystems
-- if you build in those areas, you are usually starting Phase 9+ work, not editing finished code
+- the live execution backend in [src/workflows/orchestrator.py](src/workflows/orchestrator.py) is still a placeholder that reports live execution as unavailable
+- Docker Compose is still incomplete because the repo does not contain the Dockerfiles referenced by [docker-compose.yml](docker-compose.yml)
+- the dashboard exists, but [dashboard/README.md](dashboard/README.md) is still mostly default `create-next-app` boilerplate and should not be treated as the authoritative workflow guide
 
 ## Verified Baseline
 
-The current test baseline was verified locally with:
+The current local test baseline was verified on April 16, 2026 with:
 
 ```bash
-./.venv/bin/pytest
+./.venv/bin/pytest -q
 ```
 
 Result:
 
-- `620 passed`
-- warnings only, no failures
+- `996 passed`
+- `12 warnings`
 
 The main warnings worth knowing about:
 
 - `pytest-asyncio` deprecation warnings around the custom `event_loop` fixture in [tests/conftest.py](tests/conftest.py)
 - an SQLAlchemy warning about a foreign-key cycle between `positions`, `thesis_cards`, and `workflow_runs` during SQLite drop ordering in tests
 
-Do not "fix" those casually unless your task is specifically about test infrastructure or schema cleanup.
+Do not claim the suite is fully green on a different commit or worktree unless you rerun it there.
+
+## Runtime Workflow
+
+The current backend entrypoint is [src/__main__.py](src/__main__.py).
+Startup now does real system wiring:
+
+- loads config
+- initializes [src/workflows/orchestrator.py](src/workflows/orchestrator.py)
+- starts market data and scanner services
+- starts scheduled background tasks
+- starts the FastAPI dashboard API on port `8000`
+- waits for shutdown signals or dashboard-triggered stop
+
+The orchestrated pipeline is:
+
+- Eligibility Intake
+- Trigger Scanner
+- Investigation
+- Tradeability
+- Risk Approval
+- Cost Approval
+- Execution
+- Position Review
+- Calibration
+- Performance Review
+- Policy Review
+- Viability
+- Bias Audit
+- Absence Management
+
+Recurring tasks currently registered by the orchestrator:
+
+- scheduled sweep every 8 hours
+- fast learning loop daily
+- slow learning loop weekly
+- absence monitor hourly
+- daily governor reset every 24 hours
+- dashboard state sync every 5 minutes
+
+Mode-specific behavior:
+
+- `paper` and `shadow` mode use local SQLite at `data/paper_trading.sqlite`
+- `paper` mode debits cash on entry, persists `paper_transactions`, tracks open exposure as `paper_reserved_capital_usd`, and updates equity mark-to-market during dashboard sync
+- all other operator modes use configured Postgres, but final live execution is not wired
+- dashboard state such as operator mode, paper balance, and paper transaction history persists in `data/system_state.json`
+- dashboard-persisted operator mode can override the startup config on later restarts
+
+## Current Behavior To Preserve
+
+- Investigation domain managers are expected to return `estimated_probability` on every memo.
+- `recommended_proceed=false` is reserved for structural blockers such as resolved markets, false premises, backward sides, factual errors, or fundamentally unanswerable resolution criteria.
+- Low confidence, possible market efficiency, or thin calibration are not structural blockers; those cases should remain proceed-with-caution and be normalized downstream rather than hard-rejected.
+- Scheduled sweep ranking should prefer edge-discovery quality over raw liquidity alone, and trigger-built sports candidates must still honor the configured sports horizon gate.
+- Paper-mode execution should preserve the live-style accounting split between cash, reserved capital, and mark-to-market equity, and dashboard portfolio views should expose that split.
+- Eligibility should continue using title/slug override patterns for sports and geopolitics when upstream category metadata is weak.
 
 ## Source Layout
 
-The Python source layout is unusual and matters:
+The Python source layout is unusual and still matters:
 
 - Python modules live directly under `src/`
 - imports are written as top-level packages such as `from config.settings import AppConfig`
@@ -102,15 +160,20 @@ This means:
 
 - keep using the current top-level import style
 - do not rewrite imports to `from src.config...` unless you are intentionally refactoring packaging across the repo
-- when running the app directly, you need `PYTHONPATH=src`
+- when running the backend directly, you need `PYTHONPATH=src`
 
-The current startup command that works is:
+Repository layout that matters in practice:
 
-```bash
-PYTHONPATH=src ./.venv/bin/python -m src
-```
+- [src](src): backend runtime and subsystems
+- [dashboard](dashboard): Next.js 16 / React 19 dashboard frontend
+- [config](config): YAML config
+- [migrations](migrations): Alembic
+- [data](data): runtime state files such as `paper_trading.sqlite` and `system_state.json`
 
-The command documented in some repo docs, `python -m polymarket_trader`, does not match the current source layout. Treat the code as authoritative here.
+If you work in [dashboard](dashboard):
+
+- read [dashboard/AGENTS.md](dashboard/AGENTS.md) first
+- treat `.next/` and `node_modules/` as generated artifacts
 
 ## Hard Architectural Rules
 
@@ -121,28 +184,35 @@ These are non-negotiable unless the user explicitly asks for a design change.
 The following are Tier D / deterministic-only areas and must not call LLMs:
 
 - eligibility hard gates and category filtering
-- trigger scanner hot path
+- scanner hot path, degraded-mode handling, and cache management
 - drawdown enforcement
 - capital rules
 - liquidity-relative sizing
+- base-rate lookup and deviation arithmetic
 - entry impact computation
-- cost arithmetic and budget enforcement
-- execution permission checks
-- calibration statistics
+- cost arithmetic, budgeting, and selectivity tracking
+- execution permission checks and pre-trade revalidation
+- realized slippage computation and friction parameter updates
+- deterministic position review checks
+- calibration statistics and segment threshold computation
 - bias detection statistics
 - viability metric computation
 - operator absence logic
-- base-rate lookup
-- friction model calibration
-- cache management
 
 In code, this boundary is reflected primarily in:
 
 - [src/core/constants.py](src/core/constants.py)
+- [src/eligibility](src/eligibility)
+- [src/scanner](src/scanner)
 - [src/risk](src/risk)
 - [src/cost](src/cost)
-- [src/scanner](src/scanner)
-- [src/eligibility](src/eligibility)
+- [src/investigation/entry_impact.py](src/investigation/entry_impact.py)
+- [src/execution](src/execution)
+- [src/positions/deterministic_checks.py](src/positions/deterministic_checks.py)
+- [src/calibration](src/calibration)
+- [src/bias](src/bias)
+- [src/viability](src/viability)
+- [src/absence](src/absence)
 
 ### LLM Tier Policy
 
@@ -179,7 +249,7 @@ Use the existing utilities in [src/agents/compression.py](src/agents/compression
 
 ### Cost Governor Gate
 
-Any future investigation or review workflow that uses LLMs must be built so that:
+Any workflow that uses LLMs must be built so that:
 
 - a pre-run estimate exists before the workflow starts
 - a cost-governor decision is available before the workflow starts
@@ -191,6 +261,8 @@ The existing implementation lives in:
 - [src/cost/governor.py](src/cost/governor.py)
 - [src/cost/budget.py](src/cost/budget.py)
 - [src/cost/selectivity.py](src/cost/selectivity.py)
+- [src/cost/review_costs.py](src/cost/review_costs.py)
+- [src/cost/feedback.py](src/cost/feedback.py)
 
 ### Risk Governor Authority
 
@@ -235,8 +307,8 @@ Do not add logic that lets excluded categories flow into downstream workflows un
 
 ### Core and Config
 
-- [src/config/settings.py](src/config/settings.py): Pydantic settings model loaded from YAML plus env vars
-- [config/default.yaml](config/default.yaml): default thresholds and endpoints
+- [src/config/settings.py](src/config/settings.py): Pydantic settings model loaded from YAML, env vars, and local `.env`
+- [config/default.yaml](config/default.yaml): default thresholds, budgets, and API settings
 - [src/core/enums.py](src/core/enums.py): canonical enums
 - [src/core/constants.py](src/core/constants.py): model philosophy, provider mapping, deterministic-only list
 - [src/core/types.py](src/core/types.py): shared Pydantic runtime types
@@ -244,32 +316,45 @@ Do not add logic that lets excluded categories flow into downstream workflows un
 
 ### Persistence
 
-- [src/data/models/__init__.py](src/data/models/__init__.py): core trading entities
-- [src/data/models/thesis.py](src/data/models/thesis.py): thesis cards and net-edge history
-- [src/data/models/workflow.py](src/data/models/workflow.py): runs, triggers, eligibility decisions
-- [src/data/models/*](src/data/models): calibration, cost, risk, reference, execution, notification, operator, scanner, bias, viability, logging, correlation
-- [src/data/repositories/*](src/data/repositories): async repositories
+- [src/data/models](src/data/models): ORM models for trading, workflow, calibration, risk, cost, execution, notification, bias, and viability records
+- [src/data/repositories](src/data/repositories): async repositories
 - [src/data/database.py](src/data/database.py): engine and session helpers
-- [src/data/seed.py](src/data/seed.py): base rates, thresholds, friction defaults
+- [src/data/seed.py](src/data/seed.py): base rates, thresholds, and friction defaults
 - [migrations/versions/5e8f04ccc37e_initial_schema.py](migrations/versions/5e8f04ccc37e_initial_schema.py): bootstrap migration via `Base.metadata`
 
-### Deterministic Runtime Systems
+### Market Intake and Governors
 
-- [src/market_data](src/market_data): Gamma client, CLOB client, subgraph fallback, cache, rate limiting, service
-- [src/eligibility](src/eligibility): category classification, hard rules, sports gate, profile scoring, edge scoring, engine
-- [src/scanner](src/scanner): trigger detection, degraded mode, health monitor, scanner loop
-- [src/risk](src/risk): drawdown, liquidity, correlation, capital rules, sizer, governor
-- [src/cost](src/cost): estimator, budget, selectivity, review costs, feedback, governor
+- [src/market_data](src/market_data): Gamma client, CLOB client, secondary source, cache, rate limiting, and service
+- [src/eligibility](src/eligibility): category classification, hard rules, sports gate, scoring, and engine
+- [src/scanner](src/scanner): trigger detection, degraded mode, health monitor, and scanner loop
+- [src/risk](src/risk): drawdown, liquidity, correlation, capital rules, sizer, and governor
+- [src/cost](src/cost): estimator, budget, selectivity, review costs, feedback, and governor
 
-### LLM Framework
+### Investigation to Execution
 
-- [src/agents/registry.py](src/agents/registry.py): role registry and tier assignments
-- [src/agents/prompts.py](src/agents/prompts.py): role templates plus regime injection
-- [src/agents/providers.py](src/agents/providers.py): provider router and per-call tracking
-- [src/agents/base.py](src/agents/base.py): base agent and `call_llm`
-- [src/agents/escalation.py](src/agents/escalation.py): Tier A escalation rules
-- [src/agents/regime.py](src/agents/regime.py): calibration and viability regime adaptation
-- [src/agents/types.py](src/agents/types.py): structured agent I/O and tracking records
+- [src/investigation](src/investigation): investigation orchestrator, base-rate system, entry impact, domain managers, research agents, rubric, and thesis builder
+- [src/tradeability](src/tradeability): resolution parser, tradeability synthesizer, and types
+- [src/execution](src/execution): deterministic execution engine, friction calibration helpers, slippage tracking, and execution types
+- [src/positions](src/positions): review scheduler, deterministic checks, review agents, exit classification, and manager
+
+### Calibration, Learning, and Cross-Cutting Systems
+
+- [src/calibration](src/calibration): forecast store, Brier engine, segment manager, sizing, friction, and accumulation
+- [src/learning](src/learning): fast loop, slow loop, category ledger, performance review, policy review, no-trade monitor, and patience budget
+- [src/bias](src/bias): deterministic bias detection and audit runner
+- [src/viability](src/viability): checkpoint processor and lifetime budget logic
+- [src/absence](src/absence): operator absence restrictions and wind-down management
+- [src/notifications](src/notifications): event bus, formatter, Telegram client, repositories, and delivery service
+
+### Orchestration and UI
+
+- [src/workflows/orchestrator.py](src/workflows/orchestrator.py): end-to-end system lifecycle and pipeline routing
+- [src/workflows/scheduler.py](src/workflows/scheduler.py): recurring task scheduler
+- [src/workflows/types.py](src/workflows/types.py): runtime system state and pipeline result models
+- [src/dashboard_api/app.py](src/dashboard_api/app.py): FastAPI dashboard routes and persisted shared system state
+- [src/dashboard_api/services.py](src/dashboard_api/services.py): dashboard query and aggregation layer
+- [dashboard/app/page.tsx](dashboard/app/page.tsx): main frontend dashboard shell
+- [dashboard/lib/api.ts](dashboard/lib/api.ts): frontend API client for the dashboard backend
 
 ## Development Conventions
 
@@ -286,7 +371,7 @@ Avoid adding raw dictionaries as untyped public APIs when a runtime type should 
 
 ### Imports
 
-Use the repository’s current import style:
+Use the repository's current import style:
 
 - `from config.settings import AppConfig`
 - `from risk.types import RiskAssessment`
@@ -323,16 +408,20 @@ Good patterns already present:
 
 If you change behavior in implemented areas, add or update tests.
 
-Current test organization:
+Current test organization includes:
 
 - focused module tests under `tests/test_*`
-- phase-level tests such as [tests/test_phase2_data_model.py](tests/test_phase2_data_model.py), [tests/test_phase4_eligibility.py](tests/test_phase4_eligibility.py), [tests/test_phase5_scanner.py](tests/test_phase5_scanner.py), and [tests/test_phase8_agents.py](tests/test_phase8_agents.py)
+- phase-level tests from [tests/test_phase2_data_model.py](tests/test_phase2_data_model.py) through [tests/test_phase15c_workflows.py](tests/test_phase15c_workflows.py)
 
-When adding Phase 9+ code, follow the same pattern:
+In practice:
 
-- add targeted unit tests for deterministic logic
-- add integration-style tests around service orchestration
-- add a phase-level test file when a new phase becomes substantial
+- investigation changes should usually update [tests/test_phase9_investigation.py](tests/test_phase9_investigation.py)
+- tradeability or execution changes should usually update [tests/test_phase10_tradeability_execution.py](tests/test_phase10_tradeability_execution.py)
+- position review changes should usually update [tests/test_phase11_position_management.py](tests/test_phase11_position_management.py)
+- calibration and learning changes should usually update [tests/test_phase12_calibration.py](tests/test_phase12_calibration.py) and [tests/test_phase12_learning.py](tests/test_phase12_learning.py)
+- bias, viability, or absence changes should usually update [tests/test_phase13_cross_cutting.py](tests/test_phase13_cross_cutting.py)
+- notification changes should usually update [tests/test_phase14_notifications.py](tests/test_phase14_notifications.py)
+- dashboard API or orchestration changes should usually update [tests/test_phase15_dashboard.py](tests/test_phase15_dashboard.py) or [tests/test_phase15c_workflows.py](tests/test_phase15c_workflows.py)
 
 ### Database Changes
 
@@ -343,11 +432,12 @@ If you change the data model:
 - update seed data if applicable
 - update or add Alembic migrations
 - update tests
+- consider whether dashboard queries in [src/dashboard_api/services.py](src/dashboard_api/services.py) also need updates
 
 Be careful with the existing FK cycle between `positions`, `thesis_cards`, and `workflow_runs`.
 If you change those relationships, expect SQLite test behavior and drop ordering to matter.
 
-### Postgres vs SQLite Test Environment
+### Postgres vs SQLite Test and Runtime Environments
 
 Tests use in-memory SQLite, not Postgres.
 
@@ -356,6 +446,11 @@ Important test harness details from [tests/conftest.py](tests/conftest.py):
 - PostgreSQL `JSONB` columns are remapped to generic `JSON`
 - all models are imported through `data` so `Base.metadata` is complete
 - foreign keys are enabled manually
+
+Important runtime detail:
+
+- paper and shadow mode also use SQLite, but at `data/paper_trading.sqlite`
+- all other operator modes use configured Postgres URLs from [src/config/settings.py](src/config/settings.py)
 
 If you introduce additional Postgres-specific behavior, ensure the test harness can still run or update it intentionally.
 
@@ -366,23 +461,37 @@ Use the project virtualenv binaries directly when possible.
 ### Tests
 
 ```bash
-./.venv/bin/pytest
-./.venv/bin/pytest tests/test_phase4_eligibility.py
+./.venv/bin/pytest -q
+./.venv/bin/pytest tests/test_phase9_investigation.py -q
+./.venv/bin/pytest tests/test_phase15c_workflows.py -q
 ./.venv/bin/pytest tests/test_risk/test_governor.py -q
 ```
 
-### App Startup
+### Backend Startup
 
 ```bash
+./start.sh
 PYTHONPATH=src ./.venv/bin/python -m src
+PYTHONPATH=src ./.venv/bin/python src/__main__.py
 PYTHONPATH=src ./.venv/bin/python -m src config/default.yaml
 ```
 
 Current behavior:
 
-- startup logs system readiness
-- no workflows are wired yet
-- process waits indefinitely after logging `awaiting_shutdown`
+- startup initializes the orchestrator and subsystem graph
+- scanner and scheduled tasks are started
+- the FastAPI dashboard API is started on `http://localhost:8000`
+- the process waits until a shutdown signal or dashboard stop request is received
+
+### Dashboard Frontend
+
+```bash
+cd dashboard
+npm run dev
+npm run lint
+```
+
+The frontend defaults to `http://localhost:3000` and talks to the backend API on `http://localhost:8000` unless `NEXT_PUBLIC_API_URL` overrides it.
 
 ### Migrations
 
@@ -414,41 +523,42 @@ These are important and easy to miss.
 ### Packaging / Entry-Point Inconsistency
 
 - `pyproject.toml` package naming, docs, and runtime layout are not fully aligned
-- the working startup path is currently `PYTHONPATH=src ./.venv/bin/python -m src`
-- do not assume `python -m polymarket_trader` works just because docs mention it
+- the working backend startup path is still `PYTHONPATH=src ./.venv/bin/python -m src`
+- do not assume `python -m polymarket_trader` works just because some docstrings mention it
 
-### Docker Is Not Ready
+### Docker Compose Is Still Not Ready End-to-End
 
 [docker-compose.yml](docker-compose.yml) references:
 
 - a root `Dockerfile`
-- a dashboard build under `dashboard/`
+- a dashboard `Dockerfile` under `dashboard/`
 
 But:
 
 - there is no root `Dockerfile` in the repo
-- `dashboard/` is currently empty
+- there is no `dashboard/Dockerfile` in the repo
 
-So do not claim Docker or the dashboard are currently operational.
+So do not claim Docker Compose works end-to-end without adding those files.
 
-### Dashboard and API Are Planned, Not Implemented
+### Live Trading Is Not Fully Wired
 
-The docs specify a Next.js dashboard and FastAPI dashboard API, but the repo does not contain those implementations yet.
+- shadow and paper share the full approval pipeline and differ only at the final execution backend
+- live modes currently reach a placeholder backend in [src/workflows/orchestrator.py](src/workflows/orchestrator.py)
+- do not describe the repo as having a finished exchange-connected live execution path
 
-### Many Later-Phase Packages Are Empty
+### Dashboard Docs Lag the Actual Implementation
 
-Do not build features assuming the presence of:
+- the frontend under [dashboard](dashboard) exists and is implemented
+- the API under [src/dashboard_api](src/dashboard_api) exists and is implemented
+- [dashboard/README.md](dashboard/README.md) is still mostly default scaffolding text, so use code and tests as the source of truth
 
-- investigation orchestration
-- tradeability engine
-- execution engine
-- position management runtime
-- calibration runtime workflows
-- notifications runtime
-- dashboard API
-- workflow orchestration
+### Persisted Runtime State Can Override Expectations
 
-Those must be implemented deliberately.
+- `data/system_state.json` persists operator mode, paper-balance state, and `paper_transactions` across restarts
+- dashboard-persisted mode can take precedence over config on later startup
+- `data/paper_trading.sqlite` retains paper/shadow runtime data until you intentionally reset it
+
+If behavior seems inconsistent with config, inspect those files before assuming the code is wrong.
 
 ### Secrets
 
@@ -464,13 +574,13 @@ If you need env-driven behavior, document the variable names, not the values.
 
 ## How to Extend the Repo Safely
 
-If you are implementing Phase 9+ work:
+When extending the current repo:
 
 1. preserve the deterministic/LLM boundary first
-2. build deterministic substrate before agent orchestration
-3. reuse the cost and risk governors rather than bypassing them
-4. persist structured records before adding narrative helpers
-5. add tests as you go
+2. prefer extending an existing subsystem over adding speculative parallel scaffolding
+3. reuse the current workflow orchestrator, cost governor, risk governor, and notification layer rather than bypassing them
+4. persist structured records before adding dashboard or narrative helpers
+5. add or update phase tests as you go
 
 For new LLM-powered workflows:
 
@@ -490,15 +600,23 @@ For new deterministic workflows:
 4. log state transitions clearly
 5. test edge cases first
 
+For dashboard work:
+
+1. update backend schemas and services before wiring new frontend views
+2. keep operator controls consistent with persisted dashboard state behavior
+3. treat the backend API as the source of truth, not frontend mock assumptions
+
 ## Practical Working Rule
 
-Treat this repository as an implementation of the v4 deterministic foundation plus the LLM framework, not as a finished end-to-end trader.
+Treat this repository as an end-to-end paper/shadow trading runtime with deterministic governors, agentic investigation, dashboard API, and dashboard frontend.
 
-If you are asked to work on a later-phase feature, first identify:
+Do not treat it as a finished production live-trading deployment.
 
-- which v4 spec section it belongs to
+If you are asked to work on a feature, first identify:
+
+- which current subsystem owns it
 - whether the deterministic prerequisite already exists
-- which current modules can be reused
-- which persistence records and tests need to be added
+- whether the workflow orchestrator or dashboard service already has a hook for it
+- which persistence records and tests need to move with it
 
 That distinction is the difference between extending the real codebase and writing speculative scaffolding.

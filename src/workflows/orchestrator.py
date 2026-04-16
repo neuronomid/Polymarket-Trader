@@ -354,6 +354,8 @@ class WorkflowOrchestrator:
                 _system_state["paper_balance_usd"] = balance
             if _system_state.get("start_of_day_equity_usd") is None:
                 _system_state["start_of_day_equity_usd"] = balance
+            if _system_state.get("paper_reserved_capital_usd") is None:
+                _system_state["paper_reserved_capital_usd"] = 0.0
         except ImportError:
             _log.warning("dashboard_api_not_available")
 
@@ -486,6 +488,7 @@ class WorkflowOrchestrator:
                     spread=t.spread,
                     data_source=getattr(t, "data_source", "live"),
                     market_title=watch_entry.title if watch_entry else None,
+                    category=watch_entry.category if watch_entry else None,
                 )
         except Exception:
             pass
@@ -1096,9 +1099,13 @@ class WorkflowOrchestrator:
         try:
             # Discover active markets
             markets = await self._market_data.discover_markets()
+            self._market_catalog = {
+                market.market_id: market
+                for market in markets
+                if getattr(market, "market_id", None)
+            }
 
-            # Pre-filter to the eligible horizon window (24h–90d) and sort by
-            # liquidity descending so we check the most active markets first.
+            # Pre-filter to the eligible horizon window (24h–90d).
             _now = datetime.now(tz=UTC)
             _min_horizon = timedelta(hours=self._config.eligibility.min_horizon_hours)
             _max_horizon = timedelta(days=self._config.eligibility.max_horizon_days)
@@ -1106,7 +1113,6 @@ class WorkflowOrchestrator:
                 m for m in markets
                 if m.end_date is None or _min_horizon <= (m.end_date - _now) <= _max_horizon
             ]
-            markets_filtered.sort(key=lambda m: m.liquidity or 0.0, reverse=True)
 
             _log.info(
                 "sweep_market_pool",
@@ -1118,11 +1124,11 @@ class WorkflowOrchestrator:
             eligible_candidates: list[CandidateContext] = []
             # Collect (market_id_str, elig_result) pairs for DB persistence
             _elig_decisions_to_persist: list[tuple[str, Any]] = []
-            for market in markets_filtered[:50]:  # cap to prevent overload
+            for market in markets_filtered[:200]:
                 # Skip markets with no usable title — Gamma API returned incomplete metadata.
                 # Category classification cannot work without a title, so these would only
                 # produce "unknown_category" rejections and pollute the DB with market_id as title.
-                if not market.title or not market.title.strip():
+                if not self._has_usable_title(market.title, external_market_id=market.market_id):
                     _log.debug("sweep_skip_no_title", market_id=market.market_id)
                     continue
 
@@ -1132,7 +1138,7 @@ class WorkflowOrchestrator:
                     description=market.description or "",
                     category_raw=market.category or "",
                     slug=market.slug or "",
-                    tags=market.tags or [],
+                    tags=self._normalize_market_tags(market.tags),
                     liquidity_usd=market.liquidity or 0.0,
                     spread=market.spread or 0.0,
                     end_date=market.end_date,
@@ -1166,13 +1172,11 @@ class WorkflowOrchestrator:
                         )
                     # Only INVESTIGATE_NOW markets become active investigation candidates.
                     if result.outcome == EligibilityOutcome.INVESTIGATE_NOW.value:
-                        # MarketInfo from discovery has no real-time price; use getattr safely.
-                        market_price = getattr(market, 'price', None) or getattr(market, 'mid_price', None)
-                        # Skip markets with no price data — can't compute edge without it.
-                        # The trigger-based path will catch these later with real CLOB prices.
-                        if market_price is None:
-                            _log.debug("sweep_skip_no_price", market_id=elig_input.market_id)
-                            continue
+                        market_price = (
+                            getattr(market, "price", None)
+                            or getattr(market, "mid_price", None)
+                            or 0.5
+                        )
                         # Skip near-certainty markets — no exploitable edge.
                         if market_price < 0.04 or market_price > 0.96:
                             continue
@@ -1184,13 +1188,22 @@ class WorkflowOrchestrator:
                                 category=result.category_classification.category or "unknown",
                                 trigger_class="discovery",
                                 trigger_level="C",
-                                price=getattr(market, 'price', None) or getattr(market, 'mid_price', None) or 0.5,
-                                mid_price=getattr(market, 'mid_price', None) or getattr(market, 'price', None) or 0.5,
+                                price=market_price,
+                                mid_price=market_price,
                                 spread=elig_input.spread,
                                 visible_depth_usd=elig_input.liquidity_usd,
+                                volume_24h=(
+                                    getattr(market, "volume_24h", None)
+                                    or getattr(market, "last_volume", None)
+                                ),
                                 description=market.description,
                                 end_date=market.end_date,
                                 end_date_hours=max(0.0, (market.end_date - datetime.now(tz=UTC)).total_seconds() / 3600) if market.end_date else None,
+                                edge_discovery_score=(
+                                    float(result.edge_discovery_score.final_score)
+                                    if getattr(result, "edge_discovery_score", None) is not None
+                                    else 0.0
+                                ),
                                 metadata_status=(
                                     "complete"
                                     if result.category_classification.category and elig_input.title
@@ -1204,9 +1217,11 @@ class WorkflowOrchestrator:
                             )
                         )
 
+            eligible_candidates = self._rank_sweep_candidates(eligible_candidates)
+
             _log.info(
                 "sweep_eligibility_complete",
-                markets_checked=min(len(markets_filtered), 50),
+                markets_checked=min(len(markets_filtered), 200),
                 eligible=len(eligible_candidates),
                 watch_list_size=self._scanner.get_watch_list().__len__(),
             )
@@ -1593,6 +1608,52 @@ class WorkflowOrchestrator:
             return self._scanner.get_watch_entry_by_market(market_id)
         return None
 
+    @staticmethod
+    def _has_usable_title(title: Any, *, external_market_id: str | None = None) -> bool:
+        """Return True when a title is informative enough for classification/persistence."""
+        if not isinstance(title, str):
+            return False
+        normalized = title.strip()
+        if not normalized:
+            return False
+        if normalized.lower() in {"metadata_incomplete", "unknown"}:
+            return False
+        if external_market_id and normalized == external_market_id:
+            return False
+        return True
+
+    @staticmethod
+    def _has_usable_category(category: Any) -> bool:
+        """Return True when a category is populated and not the unknown sentinel."""
+        return isinstance(category, str) and category.strip().lower() not in {"", "unknown"}
+
+    @staticmethod
+    def _normalize_market_tags(tags: Any) -> list[str]:
+        """Normalize Gamma/scanner tag payloads into a list of strings."""
+        if not tags:
+            return []
+        if isinstance(tags, list):
+            return [str(tag) for tag in tags if tag is not None]
+        if isinstance(tags, dict):
+            return [str(value) for value in tags.values() if value is not None]
+        if isinstance(tags, (set, tuple)):
+            return [str(tag) for tag in tags if tag is not None]
+        return [str(tags)]
+
+    @staticmethod
+    def _rank_sweep_candidates(
+        candidates: list[CandidateContext],
+    ) -> list[CandidateContext]:
+        """Rank scheduled-sweep candidates by edge-discovery first, liquidity second."""
+        return sorted(
+            candidates,
+            key=lambda candidate: (
+                -(candidate.edge_discovery_score or 0.0),
+                -(candidate.visible_depth_usd or 0.0),
+                candidate.market_id,
+            ),
+        )
+
     async def _load_market_catalog(self, *, force: bool = False) -> None:
         """Populate a lightweight market metadata cache from Gamma."""
         if self._market_data is None or (self._market_catalog and not force):
@@ -1613,14 +1674,14 @@ class WorkflowOrchestrator:
                 entry = self._scanner.get_watch_entry(token_id)
                 if entry is None:
                     continue
-                if not entry.title:
+                if not self._has_usable_title(entry.title, external_market_id=market.market_id):
                     entry.title = market.title
                 if not entry.description:
                     entry.description = market.description
-                if not entry.category:
+                if not self._has_usable_category(entry.category):
                     entry.category = market.category
                 if not entry.tags:
-                    entry.tags = market.tags
+                    entry.tags = self._normalize_market_tags(market.tags)
                 if not entry.resolution_source:
                     entry.resolution_source = market.resolution_source
                 if entry.end_date is None:
@@ -1635,22 +1696,32 @@ class WorkflowOrchestrator:
     ) -> dict[str, Any]:
         """Resolve market metadata from watch list, catalog, and thesis data."""
         market_info = self._market_catalog.get(external_market_id or "")
-        actual_title = (
-            (watch_entry.title if watch_entry else None)
-            or (market_info.title if market_info else None)
-            or getattr(card, "core_thesis", None)
-        )
+        watch_title = watch_entry.title if watch_entry else None
+        catalog_title = market_info.title if market_info else None
+        thesis_title = getattr(card, "core_thesis", None)
+        actual_title = None
+        if self._has_usable_title(watch_title, external_market_id=external_market_id):
+            actual_title = watch_title
+        elif self._has_usable_title(catalog_title, external_market_id=external_market_id):
+            actual_title = catalog_title
+        elif self._has_usable_title(thesis_title, external_market_id=external_market_id):
+            actual_title = thesis_title
         description = (
             (watch_entry.description if watch_entry else None)
             or (market_info.description if market_info else None)
             or getattr(card, "resolution_interpretation", None)
         )
-        raw_category = (
-            (watch_entry.category if watch_entry else None)
-            or (market_info.category if market_info else None)
-            or getattr(card, "category", None)
-        )
-        tags = list(
+        watch_category = watch_entry.category if watch_entry else None
+        catalog_category = market_info.category if market_info else None
+        thesis_category = getattr(card, "category", None)
+        raw_category = None
+        if self._has_usable_category(watch_category):
+            raw_category = watch_category
+        elif self._has_usable_category(catalog_category):
+            raw_category = catalog_category
+        elif self._has_usable_category(thesis_category):
+            raw_category = thesis_category
+        tags = self._normalize_market_tags(
             (watch_entry.tags if watch_entry else None)
             or (market_info.tags if market_info else None)
             or []
@@ -1673,7 +1744,7 @@ class WorkflowOrchestrator:
         display_title = actual_title or external_market_id or "metadata_incomplete"
 
         issues: list[str] = []
-        if not actual_title:
+        if not self._has_usable_title(actual_title, external_market_id=external_market_id):
             issues.append("missing_title")
         if category == "unknown":
             issues.append("unknown_category")
@@ -1713,6 +1784,9 @@ class WorkflowOrchestrator:
                 or (market_info.liquidity if market_info else None)
                 or 0.0
             ),
+            "last_volume": getattr(market_info, "volume_24h", None) or getattr(market_info, "last_volume", None),
+            "slug": slug,
+            "condition_id": getattr(market_info, "condition_id", None),
             "metadata_status": metadata_status,
             "metadata_issues": issues,
         }
@@ -1744,7 +1818,14 @@ class WorkflowOrchestrator:
     async def _build_candidate_from_trigger(self, trigger: Any) -> CandidateContext | None:
         """Build a trigger-based candidate with real market metadata."""
         watch_entry = self._get_watch_entry(token_id=trigger.token_id, market_id=trigger.market_id)
-        if watch_entry is None or not watch_entry.category or not watch_entry.title:
+        if (
+            watch_entry is None
+            or not self._has_usable_category(watch_entry.category)
+            or not self._has_usable_title(
+                watch_entry.title,
+                external_market_id=trigger.market_id or trigger.token_id,
+            )
+        ):
             await self._load_market_catalog(force=True)
             watch_entry = self._get_watch_entry(token_id=trigger.token_id, market_id=trigger.market_id)
         metadata = self._resolve_market_metadata(
@@ -1780,8 +1861,12 @@ class WorkflowOrchestrator:
             )
             return None
 
-        # --- Pre-filter 2: Sports short-horizon (quality-gated markets < 7 days) ---
-        if category_quality_tier == "quality_gated" and end_date_hours is not None and end_date_hours < 168:
+        # --- Pre-filter 2: Sports short-horizon (quality-gated markets below configured minimum) ---
+        if (
+            category_quality_tier == "quality_gated"
+            and end_date_hours is not None
+            and end_date_hours < self._config.eligibility.sports_min_horizon_hours
+        ):
             _log.info(
                 "candidate_skipped_sports_short_horizon",
                 market_id=trigger.market_id,
@@ -1997,7 +2082,7 @@ class WorkflowOrchestrator:
         self._portfolio.open_position_count = len(rows)
         self._portfolio.category_exposure_usd = category_exposure
         self._portfolio.current_equity_usd = round(
-            base_equity + total_realized + total_unrealized,
+            base_equity + total_open_exposure + total_realized + total_unrealized,
             2,
         )
         if self._risk_governor is not None:
@@ -2084,26 +2169,47 @@ class WorkflowOrchestrator:
                 is_active=True,
                 last_price=metadata["price"],
                 last_spread=metadata["spread"],
+                last_volume=metadata["last_volume"],
                 tags=metadata["tags"] or None,
+                slug=metadata["slug"],
+                condition_id=metadata["condition_id"],
             )
             session.add(market)
             await session.flush()
             return market
 
-        if title and market.title != title:
+        if (
+            self._has_usable_title(title, external_market_id=external_market_id)
+            and (
+                not self._has_usable_title(market.title, external_market_id=external_market_id)
+                or market.title != title
+            )
+        ):
             market.title = title
-        if description and not market.description:
+        if description and (not market.description or market.description == market.market_id):
             market.description = description
-        if category and not market.category:
+        if self._has_usable_category(category) and (
+            not self._has_usable_category(market.category) or market.category != category
+        ):
             market.category = category
         if metadata["category_quality_tier"]:
             market.category_quality_tier = metadata["category_quality_tier"]
-        if metadata["resolution_source"] and not market.resolution_source:
+        if metadata["resolution_source"] and (
+            not market.resolution_source or market.resolution_source == "polymarket.com"
+        ):
             market.resolution_source = metadata["resolution_source"]
-        if metadata["end_date"] and market.resolution_deadline is None:
+        if metadata["end_date"] and (
+            market.resolution_deadline is None or market.resolution_deadline != metadata["end_date"]
+        ):
             market.resolution_deadline = metadata["end_date"]
         if metadata["tags"] and not market.tags:
             market.tags = metadata["tags"]
+        if metadata["slug"]:
+            market.slug = metadata["slug"]
+        if metadata["condition_id"]:
+            market.condition_id = metadata["condition_id"]
+        if metadata["last_volume"] is not None:
+            market.last_volume = metadata["last_volume"]
         if metadata["price"] is not None:
             market.last_price = metadata["price"]
         if metadata["spread"] is not None:
@@ -2353,6 +2459,7 @@ class WorkflowOrchestrator:
                 workflow_run.max_tier_used = result.max_tier_used
 
             for candidate_outcome in getattr(result, "candidate_outcomes", []) or []:
+                quantitative_context = dict(candidate_outcome.quantitative_context or {})
                 session.add(StructuredLogEntry(
                     workflow_run_id=workflow_run_id,
                     market_id=candidate_outcome.market_id,
@@ -2368,7 +2475,12 @@ class WorkflowOrchestrator:
                         "reason": candidate_outcome.reason,
                         "reason_code": candidate_outcome.reason_code,
                         "reason_detail": candidate_outcome.reason_detail,
-                        "quantitative_context": candidate_outcome.quantitative_context,
+                        "proceed_blocker_code": quantitative_context.get("proceed_blocker_code"),
+                        "proceed_blocker_detail": quantitative_context.get("proceed_blocker_detail"),
+                        "estimated_probability": quantitative_context.get("estimated_probability"),
+                        "gross_edge": quantitative_context.get("gross_edge"),
+                        "composite_score": quantitative_context.get("composite_score"),
+                        "quantitative_context": quantitative_context,
                         "cost_spent_usd": candidate_outcome.cost_spent_usd,
                     },
                     message=candidate_outcome.reason,
@@ -2619,6 +2731,29 @@ class WorkflowOrchestrator:
             workflow_run.actual_cost_usd = float(getattr(card, "expected_inference_cost_usd", 0.0) or 0.0)
             await session.commit()
 
+        filled_size_usd = float(execution_result.submitted_size or size_usd)
+        try:
+            from dashboard_api.app import _system_state, save_persisted_state
+
+            dashboard_state = self._dashboard_state if self._dashboard_state is not None else _system_state
+            current_balance = float(
+                dashboard_state.get("paper_balance_usd", self._config.paper_balance_usd)
+            )
+            new_balance = round(current_balance - filled_size_usd, 2)
+            dashboard_state["paper_balance_usd"] = new_balance
+            dashboard_state.setdefault("paper_transactions", []).append({
+                "type": "trade_entry",
+                "amount_usd": -filled_size_usd,
+                "market_id": getattr(card, "market_id", ""),
+                "position_id": str(position.id),
+                "side": getattr(card, "proposed_side", "yes"),
+                "timestamp": execution_result.executed_at.isoformat(),
+                "balance_after": new_balance,
+            })
+            save_persisted_state()
+        except Exception as exc:
+            _log.debug("paper_cash_ledger_update_failed", error=str(exc))
+
         if self._scanner is not None:
             if watch_entry is not None:
                 self._scanner.update_watch_entry(
@@ -2758,6 +2893,10 @@ class WorkflowOrchestrator:
         try:
             _system_state["paper_equity_usd"] = round(
                 float(self._portfolio.current_equity_usd),
+                2,
+            )
+            _system_state["paper_reserved_capital_usd"] = round(
+                float(self._portfolio.total_open_exposure_usd),
                 2,
             )
         except Exception as exc:

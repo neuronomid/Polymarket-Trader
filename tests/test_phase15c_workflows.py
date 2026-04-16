@@ -11,13 +11,20 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import JSON, event, select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from core.enums import CostClass, ModelTier
+from data.base import Base
+from execution.types import EntryMode, ExecutionRequest
+from scanner.types import MarketWatchEntry
 from workflows.types import (
     PipelineResult,
     PipelineStage,
@@ -26,6 +33,62 @@ from workflows.types import (
     SystemState,
 )
 from workflows.scheduler import PeriodicTask, WorkflowScheduler
+
+
+class _FakeScanner:
+    """Minimal scanner stub for paper-trade and trigger-candidate tests."""
+
+    def __init__(self) -> None:
+        self._by_token: dict[str, MarketWatchEntry] = {}
+        self._by_market: dict[str, MarketWatchEntry] = {}
+
+    def get_watch_entry(self, token_id: str) -> MarketWatchEntry | None:
+        return self._by_token.get(token_id)
+
+    def get_watch_entry_by_market(self, market_id: str) -> MarketWatchEntry | None:
+        return self._by_market.get(market_id)
+
+    def add_to_watch_list(self, entry: MarketWatchEntry) -> None:
+        self._by_token[entry.token_id] = entry
+        self._by_market[entry.market_id] = entry
+
+    def update_watch_entry(self, token_id: str, **updates) -> None:
+        entry = self._by_token.get(token_id)
+        if entry is None:
+            return
+        for key, value in updates.items():
+            setattr(entry, key, value)
+
+    def get_watch_list(self) -> list[MarketWatchEntry]:
+        return list(self._by_market.values())
+
+
+async def _make_isolated_session_factory():
+    """Create an isolated in-memory SQLite session factory for workflow integration tests."""
+    eng = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        echo=False,
+    )
+
+    @event.listens_for(eng.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    for table in Base.metadata.tables.values():
+        for column in table.columns:
+            if isinstance(column.type, JSONB):
+                column.type = JSON()
+
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    return eng, async_sessionmaker(
+        bind=eng,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
 
 
 # ================================================================
@@ -430,6 +493,89 @@ class TestOrchestratorScheduledSweepPersistence:
         assert failed_call.kwargs["outcome_reason"] == "gamma down"
 
 
+class TestOrchestratorCandidateSelection:
+    """Trigger candidate construction and sweep ranking behavior."""
+
+    @pytest.mark.asyncio
+    async def test_trigger_candidate_uses_configured_sports_horizon(self):
+        from config.settings import AppConfig
+        from workflows.orchestrator import WorkflowOrchestrator
+
+        orch = WorkflowOrchestrator(AppConfig())
+        orch._scanner = _FakeScanner()
+
+        allowed_entry = MarketWatchEntry(
+            market_id="sports-allowed",
+            token_id="tok-allowed",
+            title="Will Liverpool FC win on 2026-04-19?",
+            category="sports",
+            category_quality_tier="quality_gated",
+            resolution_source="Official match result",
+            end_date=datetime.now(tz=UTC) + timedelta(hours=60),
+            last_price=0.56,
+            last_spread=0.02,
+            last_depth_top3=1500.0,
+        )
+        blocked_entry = allowed_entry.model_copy(update={
+            "market_id": "sports-blocked",
+            "token_id": "tok-blocked",
+            "end_date": datetime.now(tz=UTC) + timedelta(hours=36),
+        })
+        orch._scanner.add_to_watch_list(allowed_entry)
+        orch._scanner.add_to_watch_list(blocked_entry)
+
+        allowed_trigger = SimpleNamespace(
+            market_id="sports-allowed",
+            token_id="tok-allowed",
+            trigger_class="repricing",
+            trigger_level="C",
+            reason="repricing",
+            price=0.56,
+            spread=0.02,
+            depth_snapshot={"top3_usd": 1600.0},
+        )
+        blocked_trigger = SimpleNamespace(
+            market_id="sports-blocked",
+            token_id="tok-blocked",
+            trigger_class="repricing",
+            trigger_level="C",
+            reason="repricing",
+            price=0.56,
+            spread=0.02,
+            depth_snapshot={"top3_usd": 1600.0},
+        )
+
+        allowed_candidate = await orch._build_candidate_from_trigger(allowed_trigger)
+        blocked_candidate = await orch._build_candidate_from_trigger(blocked_trigger)
+
+        assert allowed_candidate is not None
+        assert allowed_candidate.category == "sports"
+        assert blocked_candidate is None
+
+    def test_rank_sweep_candidates_prefers_edge_over_liquidity(self):
+        from config.settings import AppConfig
+        from workflows.orchestrator import WorkflowOrchestrator
+
+        orch = WorkflowOrchestrator(AppConfig())
+        low_edge_high_liquidity = SimpleNamespace(
+            market_id="m-low-edge",
+            edge_discovery_score=0.2,
+            visible_depth_usd=9000.0,
+        )
+        high_edge_lower_liquidity = SimpleNamespace(
+            market_id="m-high-edge",
+            edge_discovery_score=0.7,
+            visible_depth_usd=1200.0,
+        )
+
+        ranked = orch._rank_sweep_candidates([
+            low_edge_high_liquidity,
+            high_edge_lower_liquidity,
+        ])
+
+        assert ranked[0].market_id == "m-high-edge"
+
+
 class TestOrchestratorPipelineResult:
     """Test pipeline result recording."""
 
@@ -657,3 +803,259 @@ class TestOrchestratorDashboardSync:
         finally:
             _system_state["daily_spend_usd"] = original_daily
             _system_state["lifetime_spend_usd"] = original_lifetime
+
+
+class TestPaperExecutionIntegration:
+    """Paper-mode execution should behave like live execution with simulated cash."""
+
+    @pytest.mark.asyncio
+    async def test_execute_paper_trade_debits_cash_and_persists_trade_objects(self):
+        from config.settings import AppConfig
+        from dashboard_api.app import _system_state
+        from workflows.orchestrator import WorkflowOrchestrator
+        from data.models import Market, Order, Position, Trade
+        from data.models.thesis import ThesisCard
+        from data.models.workflow import WorkflowRun
+
+        original_state = {
+            "operator_mode": _system_state.get("operator_mode"),
+            "paper_balance_usd": _system_state.get("paper_balance_usd"),
+            "paper_equity_usd": _system_state.get("paper_equity_usd"),
+            "paper_reserved_capital_usd": _system_state.get("paper_reserved_capital_usd"),
+            "paper_transactions": list(_system_state.get("paper_transactions", [])),
+            "start_of_day_equity_usd": _system_state.get("start_of_day_equity_usd"),
+        }
+
+        engine, session_factory = await _make_isolated_session_factory()
+        market_id = f"paper-market-{uuid.uuid4().hex[:8]}"
+        workflow_run_id = f"trig-paper-{uuid.uuid4().hex[:8]}"
+
+        try:
+            _system_state.update({
+                "operator_mode": "paper",
+                "paper_balance_usd": 500.0,
+                "paper_equity_usd": 500.0,
+                "paper_reserved_capital_usd": 0.0,
+                "paper_transactions": [],
+                "start_of_day_equity_usd": 500.0,
+            })
+
+            orch = WorkflowOrchestrator(AppConfig())
+            orch._session_factory = session_factory
+            orch._dashboard_state = _system_state
+            orch._scanner = _FakeScanner()
+            orch._calibration_store = MagicMock()
+            orch._risk_governor = MagicMock()
+            orch._risk_governor.drawdown_state = SimpleNamespace(current_drawdown_pct=0.0)
+            orch._risk_governor.update_equity = MagicMock()
+
+            card = SimpleNamespace(
+                market_id=market_id,
+                workflow_run_id=workflow_run_id,
+                category="macro_policy",
+                category_quality_tier="standard",
+                proposed_side="yes",
+                core_thesis="Paper execution test thesis",
+                why_mispriced="Recent repricing overshot the macro update",
+                supporting_evidence=[{"content": "Test support", "source": "test", "freshness": "fresh"}],
+                opposing_evidence=[],
+                invalidation_conditions=["A conflicting policy statement"],
+                resolution_interpretation="Resolves YES if the policy decision is announced",
+                probability_estimate=0.61,
+                confidence_estimate=0.64,
+                calibration_confidence=0.52,
+                gross_edge=0.06,
+                friction_adjusted_edge=0.05,
+                impact_adjusted_edge=0.048,
+                net_edge_after_cost=0.047,
+                expected_friction_spread=0.02,
+                expected_friction_slippage=0.002,
+                entry_impact_estimate_bps=5.0,
+                expected_inference_cost_usd=0.11,
+                recommended_size_band="standard",
+                urgency_of_entry="within_hours",
+                liquidity_adjusted_max_size_usd=100.0,
+                trigger_source="repricing",
+                market_implied_probability=0.55,
+                base_rate=0.50,
+                base_rate_deviation=0.11,
+            )
+            request = ExecutionRequest(
+                workflow_run_id=workflow_run_id,
+                market_id=market_id,
+                token_id="tok-paper",
+                side="buy",
+                price=0.55,
+                size_usd=100.0,
+                order_type="limit",
+                current_spread=0.02,
+                current_depth_usd=2000.0,
+                current_best_bid=0.54,
+                current_best_ask=0.56,
+                current_mid_price=0.55,
+                risk_approval="approve_normal",
+                cost_approval="approve_full",
+                tradeability_outcome="tradeable",
+                entry_impact_bps=5.0,
+                gross_edge=0.06,
+                preferred_entry_mode=EntryMode.IMMEDIATE,
+                operator_mode="paper",
+                approved_at=datetime.now(tz=UTC),
+            )
+            risk_assessment = SimpleNamespace(approval=SimpleNamespace(value="approve_normal"))
+
+            result = await orch._execute_paper_trade(
+                card,
+                request,
+                risk_assessment,
+                started=datetime.now(tz=UTC),
+            )
+
+            assert result.accepted is True
+            assert _system_state["paper_balance_usd"] == 400.0
+            assert _system_state["paper_transactions"][-1]["type"] == "trade_entry"
+            assert _system_state["paper_transactions"][-1]["amount_usd"] == -100.0
+
+            await orch._refresh_runtime_portfolio_state()
+            orch._sync_dashboard_state()
+
+            assert orch._portfolio.total_open_exposure_usd == 100.0
+            assert orch._portfolio.current_equity_usd == 500.0
+            assert _system_state["paper_reserved_capital_usd"] == 100.0
+            assert _system_state["paper_equity_usd"] == 500.0
+
+            async with session_factory() as session:
+                market = (
+                    await session.execute(
+                        select(Market).where(Market.market_id == market_id)
+                    )
+                ).scalar_one()
+                workflow_run = (
+                    await session.execute(
+                        select(WorkflowRun).where(WorkflowRun.workflow_run_id == workflow_run_id)
+                    )
+                ).scalar_one()
+                thesis_cards = (
+                    await session.execute(
+                        select(ThesisCard).where(ThesisCard.market_id == market.id)
+                    )
+                ).scalars().all()
+                positions = (
+                    await session.execute(
+                        select(Position).where(Position.market_id == market.id)
+                    )
+                ).scalars().all()
+                orders = (
+                    await session.execute(
+                        select(Order).where(Order.workflow_run_id == workflow_run.id)
+                    )
+                ).scalars().all()
+                trades = (
+                    await session.execute(
+                        select(Trade).join(Order, Trade.order_id == Order.id).where(Order.workflow_run_id == workflow_run.id)
+                    )
+                ).scalars().all()
+
+                assert len(thesis_cards) == 1
+                assert len(positions) == 1
+                assert len(orders) == 1
+                assert len(trades) == 1
+
+        finally:
+            await engine.dispose()
+            _system_state.update(original_state)
+
+    @pytest.mark.asyncio
+    async def test_mark_to_market_updates_equity_without_changing_cash(self):
+        from config.settings import AppConfig
+        from dashboard_api.app import _system_state
+        from workflows.orchestrator import WorkflowOrchestrator
+        from data.models import Market, Position
+
+        original_state = {
+            "operator_mode": _system_state.get("operator_mode"),
+            "paper_balance_usd": _system_state.get("paper_balance_usd"),
+            "paper_equity_usd": _system_state.get("paper_equity_usd"),
+            "paper_reserved_capital_usd": _system_state.get("paper_reserved_capital_usd"),
+            "start_of_day_equity_usd": _system_state.get("start_of_day_equity_usd"),
+        }
+
+        engine, session_factory = await _make_isolated_session_factory()
+        market_id = f"m2m-market-{uuid.uuid4().hex[:8]}"
+
+        try:
+            _system_state.update({
+                "operator_mode": "paper",
+                "paper_balance_usd": 400.0,
+                "paper_equity_usd": 500.0,
+                "paper_reserved_capital_usd": 100.0,
+                "start_of_day_equity_usd": 500.0,
+            })
+
+            orch = WorkflowOrchestrator(AppConfig())
+            orch._session_factory = session_factory
+            orch._dashboard_state = _system_state
+            orch._scanner = _FakeScanner()
+            orch._risk_governor = MagicMock()
+            orch._risk_governor.update_equity = MagicMock()
+
+            async with session_factory() as session:
+                market = Market(
+                    market_id=market_id,
+                    title="Mark to market test",
+                    category="macro_policy",
+                    last_price=0.55,
+                )
+                session.add(market)
+                await session.flush()
+                position = Position(
+                    market_id=market.id,
+                    side="yes",
+                    entry_price=0.55,
+                    current_price=0.55,
+                    size=100.0,
+                    remaining_size=100.0,
+                    status="open",
+                    review_tier="new",
+                    entered_at=datetime.now(tz=UTC),
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                )
+                session.add(position)
+                await session.commit()
+                position_id = str(position.id)
+
+            orch._scanner.add_to_watch_list(
+                MarketWatchEntry(
+                    market_id=market_id,
+                    token_id="tok-m2m",
+                    title="Mark to market test",
+                    category="macro_policy",
+                    is_held_position=True,
+                    position_id=position_id,
+                    last_price=0.60,
+                    last_spread=0.01,
+                )
+            )
+
+            await orch._mark_to_market_paper_positions()
+            await orch._refresh_runtime_portfolio_state()
+            orch._sync_dashboard_state()
+
+            assert _system_state["paper_balance_usd"] == 400.0
+            assert orch._portfolio.current_equity_usd == 505.0
+            assert _system_state["paper_equity_usd"] == 505.0
+            assert _system_state["paper_reserved_capital_usd"] == 100.0
+
+            async with session_factory() as session:
+                refreshed_position = (
+                    await session.execute(
+                        select(Position).join(Market, Position.market_id == Market.id).where(Market.market_id == market_id)
+                    )
+                ).scalar_one()
+                assert refreshed_position.current_price == 0.60
+                assert refreshed_position.unrealized_pnl == 5.0
+
+        finally:
+            await engine.dispose()
+            _system_state.update(original_state)

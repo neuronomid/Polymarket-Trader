@@ -235,7 +235,7 @@ class ThesisCardBuilder:
         # Prefer orchestrator's selection
         orch_supporting = orchestrator_output.get("supporting_evidence", [])
         if orch_supporting:
-            return orch_supporting[:3]
+            return [self._normalize_evidence_item(item) for item in orch_supporting[:3]]
 
         # Fallback: highest relevance from research
         sorted_evidence = sorted(
@@ -244,11 +244,7 @@ class ThesisCardBuilder:
             reverse=True,
         )
         return [
-            {
-                "content": e.content,
-                "source": e.source,
-                "freshness": e.freshness,
-            }
+            self._normalize_evidence_item(e)
             for e in sorted_evidence[:3]
         ]
 
@@ -261,15 +257,56 @@ class ThesisCardBuilder:
         # Prefer orchestrator's selection
         orch_opposing = orchestrator_output.get("opposing_evidence", [])
         if orch_opposing:
-            return orch_opposing[:3]
+            return [self._normalize_evidence_item(item) for item in orch_opposing[:3]]
 
         # Fallback: from counter-case agent
         counter = research.counter_case
         arguments = counter.get("strongest_arguments_against", [])
         return [
-            {"content": arg, "source": "counter_case_agent", "freshness": "current"}
+            self._normalize_evidence_item(
+                {
+                    "content": arg,
+                    "source": "counter_case_agent",
+                    "freshness": "current",
+                }
+            )
             for arg in arguments[:3]
         ]
+
+    def _normalize_evidence_item(
+        self,
+        item: EvidenceItem | dict[str, Any] | str,
+    ) -> dict[str, Any]:
+        """Normalize evidence payloads from research and synthesis output."""
+        if isinstance(item, EvidenceItem):
+            return {
+                "content": item.content,
+                "source": item.source,
+                "freshness": item.freshness,
+            }
+
+        if isinstance(item, str):
+            return {
+                "content": item,
+                "source": "orchestrator",
+                "freshness": "unknown",
+            }
+
+        if isinstance(item, dict):
+            content = item.get("content")
+            if not content:
+                content = str(item)
+            return {
+                "content": content,
+                "source": item.get("source", "orchestrator"),
+                "freshness": item.get("freshness", "unknown"),
+            }
+
+        return {
+            "content": str(item),
+            "source": "orchestrator",
+            "freshness": "unknown",
+        }
 
     def _determine_size_band(
         self,

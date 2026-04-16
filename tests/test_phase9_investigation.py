@@ -304,6 +304,8 @@ class TestInvestigationTypes:
     def test_domain_memo_construction(self):
         m = DomainMemo(category="politics", market_id="m1")
         assert m.recommended_proceed is False
+        assert m.proceed_blocker_code is None
+        assert m.proceed_blocker_detail is None
         assert m.confidence_level == "low"
 
     def test_research_pack_defaults(self):
@@ -959,6 +961,40 @@ class TestThesisCardBuilder:
         assert card.supporting_evidence[0]["content"] == "Custom evidence A"
         assert card.opposing_evidence[0]["content"] == "Custom counter B"
 
+    def test_build_normalizes_string_evidence(
+        self,
+        sample_candidate,
+        sample_domain_memo,
+        sample_research_pack,
+        sample_entry_impact,
+        sample_base_rate,
+        sample_rubric_score,
+        sample_net_edge,
+    ):
+        builder = ThesisCardBuilder()
+        card = builder.build(
+            candidate=sample_candidate,
+            domain_memo=sample_domain_memo,
+            research=sample_research_pack,
+            entry_impact=sample_entry_impact,
+            base_rate=sample_base_rate,
+            rubric=sample_rubric_score,
+            net_edge=sample_net_edge,
+            orchestrator_output={
+                "proposed_side": "yes",
+                "core_thesis": "Test",
+                "why_mispriced": "Test",
+                "probability_estimate": 0.57,
+                "supporting_evidence": ["Lineup news moved the true odds"],
+                "opposing_evidence": ["Market may already reflect the injury report"],
+                "invalidation_conditions": [],
+            },
+            workflow_run_id="wf-003",
+        )
+        assert card.supporting_evidence[0]["content"] == "Lineup news moved the true odds"
+        assert card.supporting_evidence[0]["source"] == "orchestrator"
+        assert card.opposing_evidence[0]["content"] == "Market may already reflect the injury report"
+
     def test_size_band_determination(self):
         builder = ThesisCardBuilder()
 
@@ -1168,6 +1204,51 @@ class TestInvestigationOrchestrator:
         prob = orchestrator._estimate_probability_from_domain(no_proceed_memo, 0.50)
         # Small exploratory offset applied even for no-proceed (Priority 4)
         assert prob == 0.52
+
+    def test_non_structural_domain_reject_is_normalized_to_proceed(
+        self,
+        mock_router,
+        sample_candidate,
+    ):
+        orchestrator = InvestigationOrchestrator(router=mock_router)
+        memo = DomainMemo(
+            category="macro_policy",
+            market_id=sample_candidate.market_id,
+            summary="Coverage is dense and calibration is still thin.",
+            concerns=["Market may already be efficient"],
+            recommended_proceed=False,
+            proceed_blocker_code="insufficient_calibration",
+            proceed_blocker_detail="Limited resolved samples in this segment",
+            confidence_level="medium",
+        )
+
+        normalized = orchestrator._normalize_domain_memo(sample_candidate, memo)
+
+        assert normalized.recommended_proceed is True
+        assert normalized.confidence_level == "low"
+        assert normalized.domain_specific_data["normalized_non_structural_reject"] is True
+        assert any("Original blocker detail" in concern for concern in normalized.concerns)
+
+    def test_structural_domain_reject_still_blocks(
+        self,
+        mock_router,
+        sample_candidate,
+    ):
+        orchestrator = InvestigationOrchestrator(router=mock_router)
+        memo = DomainMemo(
+            category="macro_policy",
+            market_id=sample_candidate.market_id,
+            summary="The market has already resolved.",
+            recommended_proceed=False,
+            proceed_blocker_code="resolved",
+            proceed_blocker_detail="Resolution source already published the final outcome",
+            confidence_level="high",
+        )
+
+        normalized = orchestrator._normalize_domain_memo(sample_candidate, memo)
+
+        assert normalized.recommended_proceed is False
+        assert normalized.proceed_blocker_code == "resolved"
 
     @pytest.mark.asyncio
     async def test_investigation_result_structure(self, mock_router):
