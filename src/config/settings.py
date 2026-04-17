@@ -136,6 +136,7 @@ class CostConfig(BaseSettings):
     """Cost Governor budgets."""
 
     daily_llm_budget_usd: float = 25.0
+    daily_llm_budget_pct: float = 0.005  # 0.5% of equity
     daily_opus_escalation_budget_usd: float = 5.0
     max_single_workflow_usd: float = 5.0
     max_per_accepted_candidate_usd: float = 10.0

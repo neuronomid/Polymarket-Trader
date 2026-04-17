@@ -14,14 +14,14 @@ database:
   password: polymarket
 
 risk:
-  max_daily_deployment_pct: 0.10
+  max_daily_deployment_pct: 0.05
   max_daily_drawdown_pct: 0.04
   max_total_open_exposure_usd: 250.0
-  max_simultaneous_positions: 5
+  max_simultaneous_positions: 1000
   soft_warning_pct: 0.01
   risk_reduction_pct: 0.02
-  entries_disabled_pct: 0.035
-  hard_kill_switch_pct: 0.04
+  entries_disabled_pct: 0.04
+  hard_kill_switch_pct: 0.08
   default_category_exposure_cap_usd: 250.0
   sports_category_exposure_cap_usd: 100.0
   max_cluster_exposure_usd: 150.0
@@ -42,7 +42,8 @@ risk:
   min_evidence_score_soft_warning: 0.6
 
 cost:
-  daily_llm_budget_usd: 5.0
+  daily_llm_budget_usd: 0.0
+  daily_llm_budget_pct: 0.005
   daily_opus_escalation_budget_usd: 1.0
   max_single_workflow_usd: 2.0
   max_per_accepted_candidate_usd: 3.0

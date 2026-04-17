@@ -2300,6 +2300,8 @@ class WorkflowOrchestrator:
         self._portfolio.current_equity_usd = current_equity
         if self._risk_governor is not None:
             self._risk_governor.update_equity(self._portfolio.current_equity_usd)
+        if self._cost_governor is not None:
+            self._cost_governor.update_equity(self._portfolio.current_equity_usd)
 
     async def _mark_to_market_paper_positions(self) -> None:
         """Update open paper positions with the latest watched-market prices."""

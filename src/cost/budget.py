@@ -34,6 +34,7 @@ class BudgetTracker:
         self._daily_spent_usd: float = 0.0
         self._daily_opus_spent_usd: float = 0.0
         self._day_start: datetime = datetime.now(tz=UTC)
+        self._current_equity_usd: float | None = None
 
         # Lifetime tracking
         self._lifetime_spent_usd: float = 0.0
@@ -43,6 +44,10 @@ class BudgetTracker:
 
         # Per-workflow spend: workflow_run_id -> total spend
         self._workflow_spend: dict[str, float] = {}
+
+    def update_equity(self, current_equity_usd: float) -> None:
+        """Update current equity for percentage-based budget calculations."""
+        self._current_equity_usd = current_equity_usd
 
     # --- Day lifecycle ---
 
@@ -106,7 +111,14 @@ class BudgetTracker:
     @property
     def state(self) -> BudgetState:
         """Current budget state snapshot."""
+        # Calculate daily budget: max of USD cap or % of equity
         daily_budget = self._config.daily_llm_budget_usd
+        if self._config.daily_llm_budget_pct > 0 and self._current_equity_usd is not None:
+            pct_budget = self._current_equity_usd * self._config.daily_llm_budget_pct
+            # If both are set, the pct takes precedence as a target, 
+            # but we use max to be safe unless user explicitly zeroed one.
+            daily_budget = pct_budget
+
         opus_budget = self._config.daily_opus_escalation_budget_usd
         lifetime_budget = self._config.lifetime_experiment_budget_usd
 

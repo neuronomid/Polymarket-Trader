@@ -127,9 +127,11 @@ export function AnalyticsPage({ categories, cost, bias, viability }: {
                 <div className="stat-label">Daily Spend</div>
                 <div style={{ fontSize: "1.1rem", fontWeight: 700, color: "var(--purple)" }}>${cost.daily_spend_usd.toFixed(2)}</div>
                 <div className="progress-track" style={{ marginTop: "0.5rem" }}>
-                  <div className="progress-fill blue" style={{ width: `${(cost.daily_spend_usd / cost.daily_budget_usd) * 100}%` }} />
+                  <div className="progress-fill blue" style={{ width: cost.daily_budget_usd > 0 ? `${(cost.daily_spend_usd / cost.daily_budget_usd) * 100}%` : "0%" }} />
                 </div>
-                <div className="stat-label" style={{ marginTop: "0.2rem" }}>of ${cost.daily_budget_usd} budget</div>
+                <div className="stat-label" style={{ marginTop: "0.2rem" }}>
+                  {cost.daily_budget_usd > 0 ? `of $${cost.daily_budget_usd.toFixed(2)} budget` : "dynamic budget"}
+                </div>
               </div>
               <div>
                 <div className="stat-label">Lifetime Budget</div>

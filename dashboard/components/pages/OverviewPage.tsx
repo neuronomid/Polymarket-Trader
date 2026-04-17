@@ -222,9 +222,11 @@ export function OverviewPage({ data }: { data: DashboardData }) {
           </div>
           <div style={{ marginTop: "0.5rem" }}>
             <div className="progress-track">
-              <div className="progress-fill blue" style={{ width: `${((data.cost?.daily_spend_usd || 0) / (data.cost?.daily_budget_usd || 25)) * 100}%` }} />
+              <div className="progress-fill blue" style={{ width: (data.cost?.daily_budget_usd || 0) > 0 ? `${((data.cost?.daily_spend_usd || 0) / data.cost!.daily_budget_usd) * 100}%` : "0%" }} />
             </div>
-            <div className="stat-label" style={{ marginTop: "0.35rem" }}>of ${data.cost?.daily_budget_usd || 25} budget</div>
+            <div className="stat-label" style={{ marginTop: "0.35rem" }}>
+              {(data.cost?.daily_budget_usd || 0) > 0 ? `of $${data.cost?.daily_budget_usd.toFixed(2)} budget` : "dynamic budget"}
+            </div>
           </div>
         </div>
 

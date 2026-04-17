@@ -1,6 +1,6 @@
 {
   "operator_mode": "paper",
-  "paper_balance_usd": 489.63,
+  "paper_balance_usd": 488.49,
   "start_of_day_equity_usd": 500.0,
   "paper_transactions": [
     {
@@ -11,6 +11,15 @@
       "side": "yes",
       "timestamp": "2026-04-17T00:05:48.059162+00:00",
       "balance_after": 400.0
+    },
+    {
+      "type": "trade_entry",
+      "amount_usd": -1.14,
+      "market_id": "553828",
+      "position_id": "fe1c4dcf-e9f8-4865-a3ca-86775ee4f458",
+      "side": "no",
+      "timestamp": "2026-04-17T00:49:37.869406+00:00",
+      "balance_after": 488.49
     }
   ]
 }

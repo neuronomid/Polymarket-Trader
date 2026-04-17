@@ -88,6 +88,10 @@ class CostGovernor:
         self._selectivity.start_day()
         self._log.info("cost_governor_day_reset")
 
+    def update_equity(self, current_equity_usd: float) -> None:
+        """Update current equity for dynamic budget calculations."""
+        self._budget.update_equity(current_equity_usd)
+
     # --- Core workflow: estimate → approve → record ---
 
     def estimate(self, request: CostEstimateRequest) -> CostEstimate:
