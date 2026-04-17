@@ -15,13 +15,13 @@ database:
 
 risk:
   max_daily_deployment_pct: 0.10
-  max_daily_drawdown_pct: 0.08
+  max_daily_drawdown_pct: 0.04
   max_total_open_exposure_usd: 250.0
   max_simultaneous_positions: 5
-  soft_warning_pct: 0.03
-  risk_reduction_pct: 0.05
-  entries_disabled_pct: 0.065
-  hard_kill_switch_pct: 0.08
+  soft_warning_pct: 0.01
+  risk_reduction_pct: 0.02
+  entries_disabled_pct: 0.035
+  hard_kill_switch_pct: 0.04
   default_category_exposure_cap_usd: 250.0
   sports_category_exposure_cap_usd: 100.0
   max_cluster_exposure_usd: 150.0

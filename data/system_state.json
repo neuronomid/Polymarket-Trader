@@ -1,3 +1,16 @@
 {
-  "operator_mode": "paper"
+  "operator_mode": "paper",
+  "paper_balance_usd": 489.63,
+  "start_of_day_equity_usd": 500.0,
+  "paper_transactions": [
+    {
+      "type": "trade_entry",
+      "amount_usd": -100.0,
+      "market_id": "stale-market",
+      "position_id": "stale-position",
+      "side": "yes",
+      "timestamp": "2026-04-17T00:05:48.059162+00:00",
+      "balance_after": 400.0
+    }
+  ]
 }

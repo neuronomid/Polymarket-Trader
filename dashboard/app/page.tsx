@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
-  AlertTriangle,
   ArrowDownCircle,
   ArrowUpCircle,
   BarChart3,
@@ -11,19 +10,15 @@ import {
   Brain,
   ChevronDown,
   DollarSign,
-  Eye,
-  Gauge,
   HeartPulse,
   LayoutDashboard,
   Play,
-  Power,
   Radio,
   RefreshCw,
   Shield,
   Square,
   Target,
   TrendingUp,
-  UserX,
   Wallet,
   Zap,
 } from "lucide-react";
@@ -122,6 +117,11 @@ const MODES = [
   { value: "live_standard", label: "Live", color: "var(--green)", desc: "Full live trading" },
 ];
 
+function formatPercent(value: number): string {
+  const percent = value * 100;
+  return Number.isInteger(percent) ? `${percent}%` : `${percent.toFixed(1)}%`;
+}
+
 export default function Dashboard() {
   const [page, setPage] = useState<Page>("overview");
   const [data, setData] = useState<DashboardData>({
@@ -134,7 +134,6 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [showModePanel, setShowModePanel] = useState(false);
-  const [showBalancePanel, setShowBalancePanel] = useState(false);
   const [balanceInput, setBalanceInput] = useState("");
   const [apiConnected, setApiConnected] = useState<boolean | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -214,6 +213,13 @@ export default function Dashboard() {
   const currentMode = data.portfolio?.operator_mode || "shadow";
   const modeInfo = MODES.find((m) => m.value === currentMode) || MODES[0];
   const isShadowOrPaper = currentMode === "shadow" || currentMode === "paper";
+  const drawdownLevel = data.risk?.drawdown_ladder.current_level || "normal";
+  const drawdownColor =
+    drawdownLevel === "normal"
+      ? "var(--text)"
+      : drawdownLevel === "soft_warning"
+        ? "var(--yellow)"
+        : "var(--red)";
 
   // Group nav items by section
   const sections = NAV_ITEMS.reduce<Record<string, typeof NAV_ITEMS>>((acc, item) => {
@@ -329,7 +335,7 @@ export default function Dashboard() {
                 <span style={{ fontSize: "0.68rem", fontWeight: 600, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Paper Balance</span>
               </div>
               <div style={{ fontSize: "1.5rem", fontWeight: 700, color: "var(--neon)", fontFamily: "var(--font-display), 'Space Grotesk', sans-serif", letterSpacing: "-0.03em" }}>
-                ${(data.paperBalance?.balance_usd ?? data.portfolio?.total_equity_usd ?? 500).toFixed(2)}
+                ${(data.paperBalance?.balance_usd ?? data.portfolio?.paper_cash_balance_usd ?? 500).toFixed(2)}
               </div>
 
               {/* Always-visible deposit/withdraw controls */}
@@ -442,15 +448,15 @@ export default function Dashboard() {
             <div className="topbar-item">
               <Shield size={12} />
               <span className="label">Drawdown</span>
-              <span className="value" style={{ color: (data.risk?.drawdown_ladder.current_drawdown_pct || 0) > 3 ? "var(--yellow)" : "var(--text)" }}>
-                {data.risk?.drawdown_ladder.current_drawdown_pct.toFixed(1) || "0.0"}%
+              <span className="value" style={{ color: drawdownColor }}>
+                {formatPercent(data.risk?.drawdown_ladder.current_drawdown_pct || 0)}
               </span>
             </div>
             <div className="topbar-item">
               <DollarSign size={12} />
               <span className="label">Balance</span>
               <span className="value" style={{ color: "var(--neon)" }}>
-                ${(data.paperBalance?.balance_usd ?? data.portfolio?.total_equity_usd ?? 0).toFixed(2)}
+                ${(data.paperBalance?.balance_usd ?? data.portfolio?.paper_cash_balance_usd ?? 0).toFixed(2)}
               </span>
             </div>
             <div className="topbar-item">

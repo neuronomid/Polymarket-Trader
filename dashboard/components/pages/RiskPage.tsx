@@ -1,20 +1,30 @@
 "use client";
 
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
-import { Shield, AlertTriangle, TrendingDown } from "lucide-react";
+import type { TooltipContentProps, TooltipValueType } from "recharts";
+import { Shield } from "lucide-react";
 import type { RiskBoard } from "@/lib/api";
 
 const CHART_COLORS = ["#39FF14", "#00D4FF", "#9B5DE5", "#FFBE0B", "#FF6B35"];
 
-const CustomTooltip = ({ active, payload }: any) => {
+function formatPercent(value: number): string {
+  const percent = value * 100;
+  return Number.isInteger(percent) ? `${percent}%` : `${percent.toFixed(1)}%`;
+}
+
+const CustomTooltip = ({
+  active,
+  payload,
+}: TooltipContentProps<TooltipValueType, string>) => {
   if (!active || !payload?.length) return null;
+  const value = Number(payload[0]?.value ?? 0);
   return (
     <div style={{
       background: "var(--bg-elevated)", border: "1px solid var(--border-glow)",
       borderRadius: "var(--radius-sm)", padding: "0.5rem 0.75rem", fontSize: "0.72rem",
     }}>
       <div style={{ fontWeight: 600 }}>{payload[0]?.payload?.category}</div>
-      <div style={{ color: "var(--neon)" }}>${payload[0]?.value?.toFixed(2)}</div>
+      <div style={{ color: "var(--neon)" }}>${value.toFixed(2)}</div>
     </div>
   );
 };
@@ -59,7 +69,7 @@ export function RiskPage({ risk }: { risk: RiskBoard | null }) {
         </div>
 
         <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", marginBottom: "0.5rem" }}>
-          <span className="stat-value" style={{ color: ddColor }}>{dd.current_drawdown_pct.toFixed(1)}%</span>
+          <span className="stat-value" style={{ color: ddColor }}>{formatPercent(dd.current_drawdown_pct)}</span>
           <span className="stat-label">current daily drawdown</span>
         </div>
 
@@ -72,10 +82,10 @@ export function RiskPage({ risk }: { risk: RiskBoard | null }) {
           }} />
           {/* Threshold markers */}
           {[
-            { pct: dd.soft_warning_pct, label: `${dd.soft_warning_pct}% Warn`, color: "var(--yellow)" },
-            { pct: dd.risk_reduction_pct, label: `${dd.risk_reduction_pct}% Reduce`, color: "var(--orange)" },
-            { pct: dd.entries_disabled_pct, label: `${dd.entries_disabled_pct}% Disable`, color: "#FF3B5C" },
-            { pct: dd.hard_kill_switch_pct, label: `${dd.hard_kill_switch_pct}% Kill`, color: "var(--red)" },
+            { pct: dd.soft_warning_pct, label: `${formatPercent(dd.soft_warning_pct)} Warn`, color: "var(--yellow)" },
+            { pct: dd.risk_reduction_pct, label: `${formatPercent(dd.risk_reduction_pct)} Reduce`, color: "var(--orange)" },
+            { pct: dd.entries_disabled_pct, label: `${formatPercent(dd.entries_disabled_pct)} Disable`, color: "#FF3B5C" },
+            { pct: dd.hard_kill_switch_pct, label: `${formatPercent(dd.hard_kill_switch_pct)} Kill`, color: "var(--red)" },
           ].map((m) => (
             <div key={m.label} className="ladder-marker" style={{
               left: `${(m.pct / dd.hard_kill_switch_pct) * 100}%`,

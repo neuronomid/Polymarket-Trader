@@ -93,15 +93,15 @@ class RiskConfig(BaseSettings):
     """Risk Governor limits. All deterministic, no LLM override."""
 
     max_daily_deployment_pct: float = 0.10
-    max_daily_drawdown_pct: float = 0.08
+    max_daily_drawdown_pct: float = 0.04
     max_total_open_exposure_usd: float = 10000.0
     max_simultaneous_positions: int = 20
 
     # Drawdown ladder thresholds
-    soft_warning_pct: float = 0.03
-    risk_reduction_pct: float = 0.05
-    entries_disabled_pct: float = 0.065
-    hard_kill_switch_pct: float = 0.08
+    soft_warning_pct: float = 0.01
+    risk_reduction_pct: float = 0.02
+    entries_disabled_pct: float = 0.035
+    hard_kill_switch_pct: float = 0.04
 
     # Category exposure caps (USD per category)
     default_category_exposure_cap_usd: float = 5000.0

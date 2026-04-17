@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -281,6 +282,58 @@ class TestWorkflowScheduler:
         assert states[1].interval_hours == 168.0
 
 
+class TestDashboardServerController:
+    """Test graceful shutdown of the embedded dashboard API server."""
+
+    @pytest.mark.asyncio
+    async def test_stop_requests_graceful_uvicorn_exit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import src.__main__ as main_module
+
+        class FakeConfig:
+            def __init__(self, *args, **kwargs) -> None:
+                self.args = args
+                self.kwargs = kwargs
+
+        class FakeServer:
+            instances: list["FakeServer"] = []
+
+            def __init__(self, config) -> None:
+                self.config = config
+                self.should_exit = False
+                self.started = asyncio.Event()
+                self.stopped = asyncio.Event()
+                self.__class__.instances.append(self)
+
+            async def serve(self) -> None:
+                self.started.set()
+                while not self.should_exit:
+                    await asyncio.sleep(0.01)
+                self.stopped.set()
+
+        monkeypatch.setitem(
+            sys.modules,
+            "uvicorn",
+            SimpleNamespace(Config=FakeConfig, Server=FakeServer),
+        )
+
+        server = main_module._DashboardAPIServer(MagicMock())
+        server.start()
+
+        while not FakeServer.instances:
+            await asyncio.sleep(0)
+
+        fake_server = FakeServer.instances[0]
+        await fake_server.started.wait()
+
+        await server.stop()
+
+        assert fake_server.should_exit is True
+        assert fake_server.stopped.is_set() is True
+
+
 # ================================================================
 # Orchestrator unit tests (no DB/network required)
 # ================================================================
@@ -337,6 +390,20 @@ class TestOrchestratorConstruction:
         assert record.cost_class == CostClass.M
         assert record.provider == "openrouter"
         orch._sync_dashboard_state.assert_called_once()
+
+    def test_dashboard_sync_runs_every_minute(self):
+        from config.settings import AppConfig
+        from workflows.orchestrator import WorkflowOrchestrator
+
+        orch = WorkflowOrchestrator(AppConfig())
+        orch._register_periodic_tasks()
+
+        dashboard_sync = next(
+            state for state in orch._scheduler.get_task_states()
+            if state.task_name == "dashboard_sync"
+        )
+
+        assert dashboard_sync.interval_hours == pytest.approx(1.0 / 60.0)
 
 
 class TestOrchestratorRegimeContext:
@@ -916,7 +983,8 @@ class TestPaperExecutionIntegration:
             assert _system_state["paper_transactions"][-1]["type"] == "trade_entry"
             assert _system_state["paper_transactions"][-1]["amount_usd"] == -100.0
 
-            await orch._refresh_runtime_portfolio_state()
+            with patch("dashboard_api.app.save_persisted_state", lambda: None):
+                await orch._refresh_runtime_portfolio_state()
             orch._sync_dashboard_state()
 
             assert orch._portfolio.total_open_exposure_usd == 100.0
@@ -978,6 +1046,8 @@ class TestPaperExecutionIntegration:
             "paper_equity_usd": _system_state.get("paper_equity_usd"),
             "paper_reserved_capital_usd": _system_state.get("paper_reserved_capital_usd"),
             "start_of_day_equity_usd": _system_state.get("start_of_day_equity_usd"),
+            "paper_transactions": list(_system_state.get("paper_transactions", [])),
+            "equity_history": list(_system_state.get("equity_history", [])),
         }
 
         engine, session_factory = await _make_isolated_session_factory()
@@ -990,6 +1060,8 @@ class TestPaperExecutionIntegration:
                 "paper_equity_usd": 500.0,
                 "paper_reserved_capital_usd": 100.0,
                 "start_of_day_equity_usd": 500.0,
+                "paper_transactions": [],
+                "equity_history": [],
             })
 
             orch = WorkflowOrchestrator(AppConfig())
@@ -1043,8 +1115,8 @@ class TestPaperExecutionIntegration:
             orch._sync_dashboard_state()
 
             assert _system_state["paper_balance_usd"] == 400.0
-            assert orch._portfolio.current_equity_usd == 505.0
-            assert _system_state["paper_equity_usd"] == 505.0
+            assert orch._portfolio.current_equity_usd == 509.09
+            assert _system_state["paper_equity_usd"] == 509.09
             assert _system_state["paper_reserved_capital_usd"] == 100.0
 
             async with session_factory() as session:
@@ -1054,7 +1126,490 @@ class TestPaperExecutionIntegration:
                     )
                 ).scalar_one()
                 assert refreshed_position.current_price == 0.60
-                assert refreshed_position.unrealized_pnl == 5.0
+                assert refreshed_position.unrealized_pnl == pytest.approx(9.0909)
+
+        finally:
+            await engine.dispose()
+            _system_state.update(original_state)
+
+    @pytest.mark.asyncio
+    async def test_refresh_runtime_portfolio_state_repairs_corrupted_paper_state_in_one_pass(self):
+        from config.settings import AppConfig
+        from dashboard_api.app import _system_state
+        from risk.governor import RiskGovernor
+        from workflows.orchestrator import WorkflowOrchestrator
+        from data.models import Market, Position
+
+        original_state = {
+            "operator_mode": _system_state.get("operator_mode"),
+            "paper_balance_usd": _system_state.get("paper_balance_usd"),
+            "paper_equity_usd": _system_state.get("paper_equity_usd"),
+            "paper_reserved_capital_usd": _system_state.get("paper_reserved_capital_usd"),
+            "start_of_day_equity_usd": _system_state.get("start_of_day_equity_usd"),
+            "paper_transactions": list(_system_state.get("paper_transactions", [])),
+            "equity_history": list(_system_state.get("equity_history", [])),
+        }
+
+        engine, session_factory = await _make_isolated_session_factory()
+        market_id = f"repair-market-{uuid.uuid4().hex[:8]}"
+
+        try:
+            _system_state.update({
+                "operator_mode": "paper",
+                "paper_balance_usd": 1117.04,
+                "paper_equity_usd": 1127.41,
+                "paper_reserved_capital_usd": 10.37,
+                "start_of_day_equity_usd": 500.0,
+                "paper_transactions": [
+                    {
+                        "type": "trade_entry",
+                        "amount_usd": -100.0,
+                        "market_id": "stale-market",
+                        "position_id": "stale-position",
+                        "side": "yes",
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
+                        "balance_after": 400.0,
+                    }
+                ],
+                "equity_history": [
+                    {
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
+                        "equity_usd": 1127.41,
+                        "pnl_usd": 627.41,
+                    },
+                    {
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
+                        "equity_usd": 1217.04,
+                        "pnl_usd": 717.04,
+                    },
+                ],
+            })
+
+            orch = WorkflowOrchestrator(AppConfig())
+            orch._session_factory = session_factory
+            orch._dashboard_state = _system_state
+            orch._risk_governor = RiskGovernor(AppConfig().risk)
+            orch._risk_governor.reset_day(start_of_day_equity=500.0)
+
+            async with session_factory() as session:
+                market = Market(
+                    market_id=market_id,
+                    title="Paper state repair test",
+                    category="macro_policy",
+                    last_price=0.40,
+                )
+                session.add(market)
+                await session.flush()
+
+                position = Position(
+                    market_id=market.id,
+                    side="yes",
+                    entry_price=0.40,
+                    current_price=0.40,
+                    size=10.0,
+                    remaining_size=10.0,
+                    status="open",
+                    review_tier="new",
+                    entered_at=datetime.now(tz=UTC),
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                )
+                session.add(position)
+                await session.commit()
+
+            await orch._refresh_runtime_portfolio_state()
+            orch._sync_dashboard_state()
+
+            assert _system_state["paper_balance_usd"] == 490.0
+            assert orch._portfolio.account_balance_usd == 490.0
+            assert orch._portfolio.total_open_exposure_usd == 10.0
+            assert orch._portfolio.current_equity_usd == 500.0
+            assert _system_state["paper_equity_usd"] == 500.0
+            assert _system_state["paper_reserved_capital_usd"] == 10.0
+            assert len(_system_state["equity_history"]) == 1
+            assert _system_state["equity_history"][0]["equity_usd"] == 500.0
+            assert _system_state["drawdown_pct"] == 0.0
+            assert _system_state["drawdown_level"] == "normal"
+        finally:
+            await engine.dispose()
+            _system_state.update(original_state)
+
+    @pytest.mark.asyncio
+    async def test_refresh_runtime_portfolio_state_is_idempotent_after_cash_repair(self):
+        from config.settings import AppConfig
+        from dashboard_api.app import _system_state
+        from risk.governor import RiskGovernor
+        from workflows.orchestrator import WorkflowOrchestrator
+        from data.models import Market, Position
+
+        original_state = {
+            "operator_mode": _system_state.get("operator_mode"),
+            "paper_balance_usd": _system_state.get("paper_balance_usd"),
+            "paper_equity_usd": _system_state.get("paper_equity_usd"),
+            "paper_reserved_capital_usd": _system_state.get("paper_reserved_capital_usd"),
+            "start_of_day_equity_usd": _system_state.get("start_of_day_equity_usd"),
+            "paper_transactions": list(_system_state.get("paper_transactions", [])),
+            "equity_history": list(_system_state.get("equity_history", [])),
+        }
+
+        engine, session_factory = await _make_isolated_session_factory()
+        market_id = f"idempotent-market-{uuid.uuid4().hex[:8]}"
+
+        try:
+            _system_state.update({
+                "operator_mode": "paper",
+                "paper_balance_usd": 937.78,
+                "paper_equity_usd": 948.15,
+                "paper_reserved_capital_usd": 10.37,
+                "start_of_day_equity_usd": 500.0,
+                "paper_transactions": [
+                    {
+                        "type": "trade_entry",
+                        "amount_usd": -100.0,
+                        "market_id": "stale-market",
+                        "position_id": "stale-position",
+                        "side": "yes",
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
+                        "balance_after": 400.0,
+                    }
+                ],
+                "equity_history": [],
+            })
+
+            orch = WorkflowOrchestrator(AppConfig())
+            orch._session_factory = session_factory
+            orch._dashboard_state = _system_state
+            orch._risk_governor = RiskGovernor(AppConfig().risk)
+            orch._risk_governor.reset_day(start_of_day_equity=500.0)
+
+            async with session_factory() as session:
+                market = Market(
+                    market_id=market_id,
+                    title="Paper state idempotence test",
+                    category="macro_policy",
+                    last_price=0.40,
+                )
+                session.add(market)
+                await session.flush()
+                session.add(
+                    Position(
+                        market_id=market.id,
+                        side="yes",
+                        entry_price=0.40,
+                        current_price=0.40,
+                        size=10.0,
+                        remaining_size=10.0,
+                        status="open",
+                        review_tier="new",
+                        entered_at=datetime.now(tz=UTC),
+                        unrealized_pnl=0.0,
+                        realized_pnl=0.0,
+                    )
+                )
+                await session.commit()
+
+            await orch._refresh_runtime_portfolio_state()
+            orch._sync_dashboard_state()
+            first_cash = _system_state["paper_balance_usd"]
+            first_equity = _system_state["paper_equity_usd"]
+
+            await orch._refresh_runtime_portfolio_state()
+            orch._sync_dashboard_state()
+
+            assert first_cash == 490.0
+            assert first_equity == 500.0
+            assert _system_state["paper_balance_usd"] == 490.0
+            assert _system_state["paper_equity_usd"] == 500.0
+            assert _system_state["paper_reserved_capital_usd"] == 10.0
+            assert _system_state["equity_history"][-1]["equity_usd"] == 500.0
+        finally:
+            await engine.dispose()
+            _system_state.update(original_state)
+
+    @pytest.mark.asyncio
+    async def test_restore_held_position_watch_list_rehydrates_open_positions(self):
+        from config.settings import AppConfig
+        from workflows.orchestrator import WorkflowOrchestrator
+        from data.models import Market, Position
+
+        engine, session_factory = await _make_isolated_session_factory()
+        market_id = f"restore-market-{uuid.uuid4().hex[:8]}"
+
+        try:
+            orch = WorkflowOrchestrator(AppConfig())
+            orch._session_factory = session_factory
+            orch._scanner = _FakeScanner()
+            orch._market_catalog = {
+                market_id: SimpleNamespace(
+                    market_id=market_id,
+                    token_ids=["tok-restore"],
+                    title="Restored watch market",
+                    description="Recovered from market catalog",
+                    category="macro_policy",
+                    resolution_source="polymarket.com",
+                    end_date=None,
+                )
+            }
+
+            async with session_factory() as session:
+                market = Market(
+                    market_id=market_id,
+                    title="Restored watch market",
+                    description="Recovered from DB",
+                    category="macro_policy",
+                    last_price=0.42,
+                )
+                session.add(market)
+                await session.flush()
+                position = Position(
+                    market_id=market.id,
+                    side="yes",
+                    entry_price=0.40,
+                    current_price=0.42,
+                    size=25.0,
+                    remaining_size=25.0,
+                    status="open",
+                    review_tier="new",
+                    entered_at=datetime.now(tz=UTC),
+                    unrealized_pnl=1.25,
+                    realized_pnl=0.0,
+                )
+                session.add(position)
+                await session.commit()
+                position_id = str(position.id)
+
+            await orch._restore_held_position_watch_list()
+
+            restored_entry = orch._scanner.get_watch_entry("tok-restore")
+            assert restored_entry is not None
+            assert restored_entry.market_id == market_id
+            assert restored_entry.is_held_position is True
+            assert restored_entry.position_id == position_id
+            assert restored_entry.last_price == 0.42
+            assert restored_entry.category == "macro_policy"
+        finally:
+            await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_mark_to_market_updates_all_open_positions_in_same_market(self):
+        from config.settings import AppConfig
+        from dashboard_api.app import _system_state
+        from workflows.orchestrator import WorkflowOrchestrator
+        from data.models import Market, Position
+        from data.models.logging import StructuredLogEntry
+
+        original_state = {
+            "operator_mode": _system_state.get("operator_mode"),
+            "paper_balance_usd": _system_state.get("paper_balance_usd"),
+            "paper_equity_usd": _system_state.get("paper_equity_usd"),
+            "paper_reserved_capital_usd": _system_state.get("paper_reserved_capital_usd"),
+            "start_of_day_equity_usd": _system_state.get("start_of_day_equity_usd"),
+            "paper_transactions": list(_system_state.get("paper_transactions", [])),
+            "equity_history": list(_system_state.get("equity_history", [])),
+        }
+
+        engine, session_factory = await _make_isolated_session_factory()
+        market_id = f"m2m-shared-market-{uuid.uuid4().hex[:8]}"
+
+        try:
+            _system_state.update({
+                "operator_mode": "paper",
+                "paper_balance_usd": 350.0,
+                "paper_equity_usd": 500.0,
+                "paper_reserved_capital_usd": 150.0,
+                "start_of_day_equity_usd": 500.0,
+                "paper_transactions": [],
+                "equity_history": [],
+            })
+
+            orch = WorkflowOrchestrator(AppConfig())
+            orch._session_factory = session_factory
+            orch._dashboard_state = _system_state
+            orch._scanner = _FakeScanner()
+            orch._risk_governor = MagicMock()
+            orch._risk_governor.update_equity = MagicMock()
+
+            async with session_factory() as session:
+                market = Market(
+                    market_id=market_id,
+                    title="Shared mark to market test",
+                    category="macro_policy",
+                    last_price=0.55,
+                )
+                session.add(market)
+                await session.flush()
+                first = Position(
+                    market_id=market.id,
+                    side="yes",
+                    entry_price=0.55,
+                    current_price=0.55,
+                    size=100.0,
+                    remaining_size=100.0,
+                    status="open",
+                    review_tier="new",
+                    entered_at=datetime.now(tz=UTC) - timedelta(minutes=5),
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                )
+                second = Position(
+                    market_id=market.id,
+                    side="yes",
+                    entry_price=0.58,
+                    current_price=0.58,
+                    size=50.0,
+                    remaining_size=50.0,
+                    status="open",
+                    review_tier="new",
+                    entered_at=datetime.now(tz=UTC) - timedelta(minutes=2),
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                )
+                session.add_all([first, second])
+                await session.commit()
+
+            orch._scanner.add_to_watch_list(
+                MarketWatchEntry(
+                    market_id=market_id,
+                    token_id="tok-shared-m2m",
+                    title="Shared mark to market test",
+                    category="macro_policy",
+                    is_held_position=True,
+                    position_id="latest-position-only",
+                    last_price=0.60,
+                    last_spread=0.01,
+                )
+            )
+
+            await orch._mark_to_market_paper_positions()
+            await orch._refresh_runtime_portfolio_state()
+            orch._sync_dashboard_state()
+
+            assert orch._portfolio.current_equity_usd == 510.81
+            assert _system_state["paper_equity_usd"] == 510.81
+            assert _system_state["paper_reserved_capital_usd"] == 150.0
+
+            async with session_factory() as session:
+                refreshed_positions = (
+                    await session.execute(
+                        select(Position)
+                        .join(Market, Position.market_id == Market.id)
+                        .where(Market.market_id == market_id)
+                        .order_by(Position.entered_at.asc())
+                    )
+                ).scalars().all()
+                assert [pos.current_price for pos in refreshed_positions] == [0.60, 0.60]
+                assert [pos.unrealized_pnl for pos in refreshed_positions] == [
+                    pytest.approx(9.0909),
+                    pytest.approx(1.7241),
+                ]
+
+                mark_to_market_logs = (
+                    await session.execute(
+                        select(StructuredLogEntry)
+                        .where(StructuredLogEntry.event_type == "position_mark_to_market")
+                        .order_by(StructuredLogEntry.logged_at.desc())
+                    )
+                ).scalars().all()
+                assert len(mark_to_market_logs) == 1
+                assert mark_to_market_logs[0].payload["position_count"] == 2
+
+        finally:
+            await engine.dispose()
+            _system_state.update(original_state)
+
+    @pytest.mark.asyncio
+    async def test_mark_to_market_updates_no_positions_using_binary_stake_pricing(self):
+        from config.settings import AppConfig
+        from dashboard_api.app import _system_state
+        from workflows.orchestrator import WorkflowOrchestrator
+        from data.models import Market, Position
+
+        original_state = {
+            "operator_mode": _system_state.get("operator_mode"),
+            "paper_balance_usd": _system_state.get("paper_balance_usd"),
+            "paper_equity_usd": _system_state.get("paper_equity_usd"),
+            "paper_reserved_capital_usd": _system_state.get("paper_reserved_capital_usd"),
+            "start_of_day_equity_usd": _system_state.get("start_of_day_equity_usd"),
+            "paper_transactions": list(_system_state.get("paper_transactions", [])),
+            "equity_history": list(_system_state.get("equity_history", [])),
+        }
+
+        engine, session_factory = await _make_isolated_session_factory()
+        market_id = f"m2m-no-market-{uuid.uuid4().hex[:8]}"
+
+        try:
+            _system_state.update({
+                "operator_mode": "paper",
+                "paper_balance_usd": 400.0,
+                "paper_equity_usd": 500.0,
+                "paper_reserved_capital_usd": 100.0,
+                "start_of_day_equity_usd": 500.0,
+                "paper_transactions": [],
+                "equity_history": [],
+            })
+
+            orch = WorkflowOrchestrator(AppConfig())
+            orch._session_factory = session_factory
+            orch._dashboard_state = _system_state
+            orch._scanner = _FakeScanner()
+            orch._risk_governor = MagicMock()
+            orch._risk_governor.update_equity = MagicMock()
+
+            async with session_factory() as session:
+                market = Market(
+                    market_id=market_id,
+                    title="NO mark to market test",
+                    category="macro_policy",
+                    last_price=0.30,
+                )
+                session.add(market)
+                await session.flush()
+                position = Position(
+                    market_id=market.id,
+                    side="no",
+                    entry_price=0.30,
+                    current_price=0.30,
+                    size=100.0,
+                    remaining_size=100.0,
+                    status="open",
+                    review_tier="new",
+                    entered_at=datetime.now(tz=UTC),
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                )
+                session.add(position)
+                await session.commit()
+                position_id = str(position.id)
+
+            orch._scanner.add_to_watch_list(
+                MarketWatchEntry(
+                    market_id=market_id,
+                    token_id="tok-no-m2m",
+                    title="NO mark to market test",
+                    category="macro_policy",
+                    is_held_position=True,
+                    position_id=position_id,
+                    last_price=0.25,
+                    last_spread=0.01,
+                )
+            )
+
+            await orch._mark_to_market_paper_positions()
+            await orch._refresh_runtime_portfolio_state()
+            orch._sync_dashboard_state()
+
+            assert _system_state["paper_balance_usd"] == 400.0
+            assert orch._portfolio.current_equity_usd == 507.14
+            assert _system_state["paper_equity_usd"] == 507.14
+
+            async with session_factory() as session:
+                refreshed_position = (
+                    await session.execute(
+                        select(Position).join(Market, Position.market_id == Market.id).where(Market.market_id == market_id)
+                    )
+                ).scalar_one()
+                assert refreshed_position.current_price == 0.25
+                assert refreshed_position.unrealized_pnl == pytest.approx(7.1429)
 
         finally:
             await engine.dispose()

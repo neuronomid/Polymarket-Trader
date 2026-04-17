@@ -3,6 +3,29 @@
 import { Target} from "lucide-react";
 import type { PositionSummary } from "@/lib/api";
 
+function formatPrice(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "—";
+  const decimals = Math.abs(value) < 1 ? 4 : 2;
+  return `$${value.toFixed(decimals)}`;
+}
+
+function formatSignedUsd(value: number | null | undefined): string {
+  const amount = Number(value ?? 0);
+  if (!Number.isFinite(amount) || amount === 0) {
+    return "$0.00";
+  }
+  if (amount > 0 && amount < 0.01) {
+    return "<$0.01";
+  }
+  if (amount < 0 && amount > -0.01) {
+    return "-$0.01";
+  }
+  if (amount > 0) {
+    return `+$${amount.toFixed(2)}`;
+  }
+  return `-$${Math.abs(amount).toFixed(2)}`;
+}
+
 export function PositionsPage({ positions }: { positions: PositionSummary[] }) {
   const open = positions.filter((p) => p.status === "open");
   const closed = positions.filter((p) => p.status === "closed");
@@ -50,16 +73,16 @@ export function PositionsPage({ positions }: { positions: PositionSummary[] }) {
                       {pos.side.toUpperCase()}
                     </span>
                   </td>
-                  <td>${pos.entry_price.toFixed(2)}</td>
-                  <td style={{ color: (pos.current_price || 0) > pos.entry_price ? "var(--green)" : (pos.current_price || 0) < pos.entry_price ? "var(--red)" : "var(--text)" }}>
-                    ${(pos.current_price || 0).toFixed(2)}
+                  <td>{formatPrice(pos.entry_price)}</td>
+                  <td style={{ color: pos.current_price == null ? "var(--text)" : pos.current_price > pos.entry_price ? "var(--green)" : pos.current_price < pos.entry_price ? "var(--red)" : "var(--text)" }}>
+                    {formatPrice(pos.current_price)}
                   </td>
-                  <td>${pos.size.toFixed(0)}</td>
+                  <td>${pos.size.toFixed(2)}</td>
                   <td style={{
                     color: (pos.unrealized_pnl || 0) >= 0 ? "var(--green)" : "var(--red)",
                     fontWeight: 600,
                   }}>
-                    {(pos.unrealized_pnl || 0) >= 0 ? "+" : ""}${(pos.unrealized_pnl || 0).toFixed(2)}
+                    {formatSignedUsd(pos.unrealized_pnl)}
                   </td>
                   <td>
                     <span className={`badge ${pos.review_tier === "new" ? "blue" : pos.review_tier === "stable" ? "green" : "muted"}`}>
@@ -72,6 +95,21 @@ export function PositionsPage({ positions }: { positions: PositionSummary[] }) {
                 </tr>
               ))}
             </tbody>
+            {open.length > 0 && (
+              <tfoot>
+                <tr style={{ borderTop: "2px solid var(--border)", fontWeight: "bold", backgroundColor: "rgba(255,255,255,0.02)" }}>
+                  <td colSpan={5} style={{ textAlign: "right", padding: "0.8rem 1rem" }}>TOTAL</td>
+                  <td style={{ padding: "0.8rem 1rem" }}>${open.reduce((sum, p) => sum + p.size, 0).toFixed(2)}</td>
+                  <td style={{
+                    padding: "0.8rem 1rem",
+                    color: open.reduce((sum, p) => sum + (p.unrealized_pnl || 0), 0) >= 0 ? "var(--green)" : "var(--red)",
+                  }}>
+                    {formatSignedUsd(open.reduce((sum, p) => sum + (p.unrealized_pnl || 0), 0))}
+                  </td>
+                  <td colSpan={2} style={{ padding: "0.8rem 1rem" }}></td>
+                </tr>
+              </tfoot>
+            )}
           </table>
         </div>
         {open.length === 0 && (

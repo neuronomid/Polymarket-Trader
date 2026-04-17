@@ -117,7 +117,7 @@ _system_state: dict[str, Any] = {
     "active_alerts_count": 0,
     # Paper balance tracking
     "paper_balance_usd": _persisted.get("paper_balance_usd", 500.0),
-    "paper_equity_usd": _persisted.get("paper_balance_usd", 500.0),
+    "paper_equity_usd": _persisted.get("start_of_day_equity_usd", 500.0),
     "paper_reserved_capital_usd": 0.0,
     "start_of_day_equity_usd": _persisted.get("start_of_day_equity_usd", 500.0),
     "paper_transactions": _persisted.get("paper_transactions", []),
@@ -474,15 +474,10 @@ def create_dashboard_app() -> FastAPI:
     async def stop_agents(
         service: DashboardService = Depends(get_dashboard_service),
     ):
-        """Stop all agents and trigger system shutdown."""
+        """Stop agents without terminating the dashboard process."""
         result = await service.toggle_agents(running=False)
-        _add_activity("system", "Operator", "System shutdown requested from dashboard", severity="warning")
-        # Trigger graceful system shutdown
-        if _shutdown_event is not None:
-            _log.info("dashboard_shutdown_requested")
-            _shutdown_event.set()
-        else:
-            _log.warning("shutdown_event_not_wired", message="No shutdown event — system state toggled only")
+        _add_activity("system", "Operator", "Agents stop requested from dashboard", severity="warning")
+        _log.info("dashboard_agents_stop_requested")
         return result
 
     @app.post(

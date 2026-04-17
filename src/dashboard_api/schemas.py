@@ -108,10 +108,10 @@ class DrawdownLadder(BaseModel):
     """Current drawdown defense ladder state."""
 
     current_drawdown_pct: float = 0.0
-    soft_warning_pct: float = 0.03
-    risk_reduction_pct: float = 0.05
-    entries_disabled_pct: float = 0.065
-    hard_kill_switch_pct: float = 0.08
+    soft_warning_pct: float = 0.01
+    risk_reduction_pct: float = 0.02
+    entries_disabled_pct: float = 0.035
+    hard_kill_switch_pct: float = 0.04
     current_level: str = "normal"
 
 

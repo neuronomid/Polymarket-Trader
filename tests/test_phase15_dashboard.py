@@ -10,6 +10,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -45,7 +46,12 @@ from dashboard_api.schemas import (
     WorkflowRunSummary,
 )
 from dashboard_api.services import DashboardService
-from dashboard_api.app import create_dashboard_app, _system_state, set_app_config
+from dashboard_api.app import (
+    _system_state,
+    create_dashboard_app,
+    set_app_config,
+    set_shutdown_event,
+)
 
 # ─── Imports for ORM test data ───────────────
 from data.models import Market, Position
@@ -71,6 +77,8 @@ class TestSchemas:
     def test_portfolio_overview_defaults(self):
         overview = PortfolioOverview()
         assert overview.total_equity_usd == 0.0
+        assert overview.paper_cash_balance_usd == 0.0
+        assert overview.paper_equity_usd == 0.0
         assert overview.paper_reserved_capital_usd == 0.0
         assert overview.open_positions_count == 0
         assert overview.drawdown_level == "normal"
@@ -81,6 +89,8 @@ class TestSchemas:
     def test_portfolio_overview_populated(self):
         overview = PortfolioOverview(
             total_equity_usd=12345.67,
+            paper_cash_balance_usd=7345.67,
+            paper_equity_usd=12345.67,
             paper_reserved_capital_usd=5000.0,
             total_open_exposure_usd=5000.0,
             daily_pnl_usd=-42.50,
@@ -93,6 +103,8 @@ class TestSchemas:
             system_status="running",
         )
         assert overview.total_equity_usd == 12345.67
+        assert overview.paper_cash_balance_usd == 7345.67
+        assert overview.paper_equity_usd == 12345.67
         assert overview.paper_reserved_capital_usd == 5000.0
         assert overview.daily_pnl_usd == -42.50
         assert overview.drawdown_level == "soft_warning"
@@ -135,10 +147,10 @@ class TestSchemas:
     def test_drawdown_ladder_defaults(self):
         ladder = DrawdownLadder()
         assert ladder.current_drawdown_pct == 0.0
-        assert ladder.soft_warning_pct == 0.03
-        assert ladder.risk_reduction_pct == 0.05
-        assert ladder.entries_disabled_pct == 0.065
-        assert ladder.hard_kill_switch_pct == 0.08
+        assert ladder.soft_warning_pct == 0.01
+        assert ladder.risk_reduction_pct == 0.02
+        assert ladder.entries_disabled_pct == 0.035
+        assert ladder.hard_kill_switch_pct == 0.04
         assert ladder.current_level == "normal"
 
     def test_exposure_by_category(self):
@@ -426,6 +438,8 @@ class TestDashboardServiceDB:
         )
         overview = await service.get_portfolio_overview()
         assert overview.total_equity_usd == 545.0
+        assert overview.paper_cash_balance_usd == 500.0
+        assert overview.paper_equity_usd == 545.0
         assert overview.paper_reserved_capital_usd == 120.0
 
     async def test_get_positions_all(self, populated_session):
@@ -783,6 +797,7 @@ class TestDashboardAPI:
 
         set_session_factory(FakeSessionFactory())
         set_app_config(AppConfig())
+        set_shutdown_event(asyncio.Event())
 
         # Reset system state for each test
         _system_state.clear()
@@ -814,6 +829,8 @@ class TestDashboardAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert "total_equity_usd" in data
+        assert "paper_cash_balance_usd" in data
+        assert "paper_equity_usd" in data
         assert "paper_reserved_capital_usd" in data
         assert "drawdown_level" in data
         assert "operator_mode" in data
@@ -888,6 +905,7 @@ class TestDashboardAPI:
         assert portfolio_resp.status_code == 200
         portfolio = portfolio_resp.json()
         assert portfolio["total_equity_usd"] == 525.0
+        assert portfolio["paper_cash_balance_usd"] == 525.0
         assert portfolio["equity_history"][-1]["equity_usd"] == 525.0
 
     async def test_paper_balance_withdraw_updates_portfolio_equity_immediately(
@@ -916,6 +934,7 @@ class TestDashboardAPI:
         assert portfolio_resp.status_code == 200
         portfolio = portfolio_resp.json()
         assert portfolio["total_equity_usd"] == 525.0
+        assert portfolio["paper_cash_balance_usd"] == 525.0
         assert portfolio["equity_history"][-1]["equity_usd"] == 525.0
 
     async def test_calibration_endpoint(self, client: AsyncClient):
@@ -1010,6 +1029,28 @@ class TestDashboardAPI:
         assert data["success"]
         assert "stopped" in data["message"].lower()
 
+    async def test_control_agents_stop_does_not_trigger_shutdown(self, client: AsyncClient):
+        """Stopping agents should not terminate the whole process."""
+        shutdown_event = asyncio.Event()
+        set_shutdown_event(shutdown_event)
+
+        resp = await client.post("/api/control/agents/stop")
+
+        assert resp.status_code == 200
+        assert shutdown_event.is_set() is False
+
+    async def test_control_shutdown_triggers_shutdown_event(self, client: AsyncClient):
+        """Explicit shutdown endpoint should trigger graceful process shutdown."""
+        shutdown_event = asyncio.Event()
+        set_shutdown_event(shutdown_event)
+
+        resp = await client.post("/api/control/shutdown")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is True
+        assert shutdown_event.is_set() is True
+
     async def test_position_not_found(self, client: AsyncClient):
         """Requesting a non-existent position returns 404."""
         fake_id = str(uuid.uuid4())
@@ -1050,7 +1091,7 @@ class TestStateConsistency:
             "system_status": "running",
             "agents_running": False,
             "drawdown_level": "soft_warning",
-            "drawdown_pct": 3.5,
+            "drawdown_pct": 0.035,
         }
         service = DashboardService(session=session, system_state=state)
 
@@ -1058,9 +1099,9 @@ class TestStateConsistency:
         risk = await service.get_risk_board()
 
         assert portfolio.drawdown_level == "soft_warning"
-        assert portfolio.drawdown_pct == 3.5
+        assert portfolio.drawdown_pct == 0.035
         assert risk.drawdown_ladder.current_level == "soft_warning"
-        assert risk.drawdown_ladder.current_drawdown_pct == 3.5
+        assert risk.drawdown_ladder.current_drawdown_pct == 0.035
 
 
 # =============================================================================
@@ -1083,7 +1124,7 @@ class TestEdgeCases:
     def test_drawdown_ladder_at_kill_switch(self):
         """DrawdownLadder at kill switch level."""
         ladder = DrawdownLadder(
-            current_drawdown_pct=8.5,
+            current_drawdown_pct=0.045,
             current_level="hard_kill_switch",
         )
         assert ladder.current_drawdown_pct > ladder.hard_kill_switch_pct

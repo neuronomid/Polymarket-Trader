@@ -178,6 +178,7 @@ class WorkflowOrchestrator:
 
         # Scheduler
         self._scheduler = WorkflowScheduler()
+        self._bootstrap_task: asyncio.Task[None] | None = None
 
         # Portfolio state (in-memory, updated by events)
         balance = getattr(config, "paper_balance_usd", 500.0)
@@ -193,6 +194,7 @@ class WorkflowOrchestrator:
 
         # Investigation cooldown: market_id → (rejected_at, price_at_rejection)
         self._investigation_cooldown: dict[str, tuple[datetime, float]] = {}
+        self._skip_next_equity_snapshot = False
 
     # ================================================================
     # Lifecycle
@@ -375,6 +377,8 @@ class WorkflowOrchestrator:
 
         _log.info("orchestrator_starting")
 
+        await self._refresh_runtime_portfolio_state()
+
         # Reset daily governors
         self._cost_governor.reset_day()
         self._risk_governor.reset_day(start_of_day_equity=self._portfolio.current_equity_usd)
@@ -386,6 +390,9 @@ class WorkflowOrchestrator:
         # Start scanner
         await self._scanner.start()
         self._state.scanner_running = True
+        self._bootstrap_task = asyncio.create_task(
+            self._bootstrap_held_position_watch_list()
+        )
         self._log_activity("system", "Scanner", "Trigger scanner started — polling CLOB API", severity="success")
 
         # Register periodic tasks
@@ -426,6 +433,14 @@ class WorkflowOrchestrator:
 
         # Stop periodic tasks
         await self._scheduler.stop_all()
+
+        if self._bootstrap_task and not self._bootstrap_task.done():
+            self._bootstrap_task.cancel()
+            try:
+                await self._bootstrap_task
+            except asyncio.CancelledError:
+                pass
+        self._bootstrap_task = None
 
         # Stop scanner
         if self._scanner and self._scanner.is_running:
@@ -1432,11 +1447,11 @@ class WorkflowOrchestrator:
             initial_delay_seconds=600.0,
         )
 
-        # Dashboard state sync: every 5 minutes
+        # Dashboard state sync / paper mark-to-market: every minute
         self._scheduler.register(
             "dashboard_sync",
             self._run_dashboard_sync,
-            interval_hours=5.0 / 60.0,
+            interval_hours=1.0 / 60.0,
             initial_delay_seconds=15.0,
         )
 
@@ -1527,6 +1542,16 @@ class WorkflowOrchestrator:
         await self._mark_to_market_paper_positions()
         await self._refresh_runtime_portfolio_state()
         self._sync_dashboard_state()
+
+    async def _bootstrap_held_position_watch_list(self) -> None:
+        """Best-effort background bootstrap for held-position scanner watches."""
+        try:
+            await self._load_market_catalog(force=True)
+            await self._restore_held_position_watch_list()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.warning("held_position_watch_bootstrap_failed", error=str(exc))
 
     # ================================================================
     # Helpers
@@ -1686,6 +1711,89 @@ class WorkflowOrchestrator:
                     entry.resolution_source = market.resolution_source
                 if entry.end_date is None:
                     entry.end_date = market.end_date
+
+    async def _restore_held_position_watch_list(self) -> None:
+        """Rehydrate open positions into the scanner watch list after restart."""
+        if self._scanner is None or self._session_factory is None or not self._market_catalog:
+            return
+
+        from data.models import Market, Position
+
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(Position, Market)
+                    .join(Market, Position.market_id == Market.id)
+                    .where(Position.status == "open")
+                )
+            ).all()
+
+        restored = 0
+        for position, market in rows:
+            market_info = self._market_catalog.get(market.market_id)
+            token_id = market_info.token_ids[0] if market_info and getattr(market_info, "token_ids", None) else None
+            if not token_id:
+                continue
+
+            title = (
+                market.title
+                if self._has_usable_title(market.title, external_market_id=market.market_id)
+                else getattr(market_info, "title", market.market_id)
+            )
+            category = (
+                market.category
+                if self._has_usable_category(market.category)
+                else getattr(market_info, "category", "unknown")
+            )
+            last_price = float(
+                position.current_price
+                if position.current_price is not None
+                else position.entry_price
+            )
+
+            existing = self._scanner.get_watch_entry(token_id)
+            if existing is not None:
+                self._scanner.update_watch_entry(
+                    token_id,
+                    market_id=market.market_id,
+                    title=title,
+                    description=market.description or getattr(market_info, "description", None),
+                    category=category,
+                    category_quality_tier=(
+                        market.category_quality_tier
+                        or ("quality_gated" if category == "sports" else "standard")
+                    ),
+                    resolution_source=market.resolution_source or getattr(market_info, "resolution_source", None),
+                    tags=self._normalize_market_tags(market.tags),
+                    end_date=market.resolution_deadline or getattr(market_info, "end_date", None),
+                    is_held_position=True,
+                    position_id=str(position.id),
+                    last_price=last_price,
+                )
+            else:
+                self._scanner.add_to_watch_list(
+                    MarketWatchEntry(
+                        market_id=market.market_id,
+                        token_id=token_id,
+                        title=title,
+                        description=market.description or getattr(market_info, "description", None),
+                        category=category,
+                        category_quality_tier=(
+                            market.category_quality_tier
+                            or ("quality_gated" if category == "sports" else "standard")
+                        ),
+                        resolution_source=market.resolution_source or getattr(market_info, "resolution_source", None),
+                        tags=self._normalize_market_tags(market.tags),
+                        end_date=market.resolution_deadline or getattr(market_info, "end_date", None),
+                        is_held_position=True,
+                        position_id=str(position.id),
+                        last_price=last_price,
+                    )
+                )
+            restored += 1
+
+        if restored:
+            _log.info("held_positions_watch_list_restored", restored=restored)
 
     def _resolve_market_metadata(
         self,
@@ -2026,65 +2134,170 @@ class WorkflowOrchestrator:
         entry_price: float,
         current_price: float,
     ) -> float:
-        """Compute paper PnL using the repo's position-size convention."""
+        """Compute paper PnL using stake-based binary contract pricing."""
         if side == "no":
-            return round(size * (entry_price - current_price), 2)
-        return round(size * (current_price - entry_price), 2)
+            denominator = 1.0 - entry_price
+            if denominator <= 0:
+                _log.warning(
+                    "paper_pnl_invalid_no_entry_price",
+                    side=side,
+                    entry_price=entry_price,
+                    current_price=current_price,
+                    size=size,
+                )
+                return 0.0
+            return round(size * (entry_price - current_price) / denominator, 4)
+
+        if entry_price <= 0:
+            _log.warning(
+                "paper_pnl_invalid_yes_entry_price",
+                side=side,
+                entry_price=entry_price,
+                current_price=current_price,
+                size=size,
+            )
+            return 0.0
+
+        return round(size * (current_price - entry_price) / entry_price, 4)
+
+    def _paper_manual_cash_delta(self, transactions: list[Any]) -> float:
+        """Sum only manual deposits and withdrawals from the paper ledger."""
+        delta = 0.0
+        for transaction in transactions:
+            if not isinstance(transaction, dict):
+                continue
+            tx_type = transaction.get("type")
+            if tx_type not in {"deposit", "withdraw"}:
+                continue
+            try:
+                amount = float(transaction.get("amount_usd", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+
+            if tx_type == "deposit":
+                delta += abs(amount)
+            else:
+                delta -= abs(amount)
+
+        return round(delta, 2)
+
+    def _replace_dashboard_equity_history(
+        self,
+        *,
+        equity_usd: float,
+        start_of_day: float,
+    ) -> None:
+        """Replace the chart history with a single corrected equity point."""
+        if self._dashboard_state is None:
+            return
+
+        self._dashboard_state["equity_history"] = [{
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "equity_usd": round(equity_usd, 2),
+            "pnl_usd": round(equity_usd - start_of_day, 2),
+        }]
+        self._skip_next_equity_snapshot = True
 
     async def _refresh_runtime_portfolio_state(self) -> None:
         """Keep the in-memory portfolio aligned with dashboard state and DB."""
         self._portfolio.operator_mode = self._current_mode()
 
-        base_equity = (
-            float(self._dashboard_state.get("paper_balance_usd", self._config.paper_balance_usd))
+        start_of_day = (
+            float(
+                self._dashboard_state.get(
+                    "start_of_day_equity_usd",
+                    self._config.paper_balance_usd,
+                )
+            )
             if self._dashboard_state is not None
             else float(self._config.paper_balance_usd)
         )
-        start_of_day = (
-            float(self._dashboard_state.get("start_of_day_equity_usd", base_equity))
+        manual_cash_delta = (
+            self._paper_manual_cash_delta(self._dashboard_state.get("paper_transactions", []))
             if self._dashboard_state is not None
-            else base_equity
+            else 0.0
         )
 
-        self._portfolio.account_balance_usd = base_equity
         self._portfolio.start_of_day_equity_usd = start_of_day
 
-        if self._session_factory is None:
-            self._portfolio.current_equity_usd = base_equity
-            return
+        rows: list[tuple[Any, Any, Any, Any]] = []
+        total_realized = 0.0
 
-        from data.models import Market, Position
+        if self._session_factory is not None:
+            from data.models import Market, Position
 
-        async with self._session_factory() as session:
-            open_result = await session.execute(
-                select(Position.size, Position.unrealized_pnl, Market.category)
-                .join(Market, Position.market_id == Market.id)
-                .where(Position.status == "open")
-            )
-            rows = open_result.all()
-
-            realized_result = await session.execute(
-                select(func.coalesce(func.sum(Position.realized_pnl), 0.0))
-            )
-            total_realized = float(realized_result.scalar_one() or 0.0)
+            async with self._session_factory() as session:
+                open_result = await session.execute(
+                    select(
+                        Position.size,
+                        Position.unrealized_pnl,
+                        Position.realized_pnl,
+                        Market.category,
+                    )
+                    .join(Market, Position.market_id == Market.id)
+                    .where(Position.status == "open")
+                )
+                rows = open_result.all()
 
         total_open_exposure = 0.0
         total_unrealized = 0.0
         category_exposure: dict[str, float] = {}
-        for size, unrealized, category in rows:
+        for size, unrealized, realized, category in rows:
             size_value = float(size or 0.0)
             total_open_exposure += size_value
             total_unrealized += float(unrealized or 0.0)
+            total_realized += float(realized or 0.0)
             cat = category or "unknown"
             category_exposure[cat] = category_exposure.get(cat, 0.0) + size_value
+
+        cash_balance = round(
+            float(self._config.paper_balance_usd) + manual_cash_delta - total_open_exposure,
+            2,
+        )
+        current_equity = round(
+            cash_balance + total_open_exposure + total_realized + total_unrealized,
+            2,
+        )
+
+        if self._dashboard_state is not None:
+            previous_cash_balance = round(
+                float(self._dashboard_state.get("paper_balance_usd", cash_balance)),
+                2,
+            )
+            cash_repaired = previous_cash_balance != cash_balance
+
+            self._dashboard_state["paper_balance_usd"] = cash_balance
+            self._dashboard_state["paper_equity_usd"] = current_equity
+            self._dashboard_state["paper_reserved_capital_usd"] = round(
+                total_open_exposure,
+                2,
+            )
+
+            if cash_repaired:
+                _log.info(
+                    "paper_cash_balance_repaired",
+                    previous_balance_usd=previous_cash_balance,
+                    repaired_balance_usd=cash_balance,
+                    manual_cash_delta_usd=manual_cash_delta,
+                    open_exposure_usd=round(total_open_exposure, 2),
+                    open_positions=len(rows),
+                )
+                self._replace_dashboard_equity_history(
+                    equity_usd=current_equity,
+                    start_of_day=start_of_day,
+                )
+                try:
+                    from dashboard_api.app import save_persisted_state
+
+                    save_persisted_state()
+                except Exception as exc:
+                    _log.debug("paper_cash_repair_persist_failed", error=str(exc))
 
         self._portfolio.total_open_exposure_usd = round(total_open_exposure, 2)
         self._portfolio.open_position_count = len(rows)
         self._portfolio.category_exposure_usd = category_exposure
-        self._portfolio.current_equity_usd = round(
-            base_equity + total_open_exposure + total_realized + total_unrealized,
-            2,
-        )
+        self._portfolio.account_balance_usd = cash_balance
+        self._portfolio.current_equity_usd = current_equity
         if self._risk_governor is not None:
             self._risk_governor.update_equity(self._portfolio.current_equity_usd)
 
@@ -2097,42 +2310,97 @@ class WorkflowOrchestrator:
 
         held_entries = [
             entry for entry in self._scanner.get_watch_list()
-            if entry.is_held_position and entry.position_id and entry.last_price is not None
+            if entry.is_held_position and entry.market_id and entry.last_price is not None
         ]
         if not held_entries:
             return
 
-        from data.models import Market, Position
+        watched_markets = {
+            entry.market_id: entry
+            for entry in held_entries
+        }
+        if not watched_markets:
+            return
 
-        updated = False
+        from data.models import Market, Position
+        from data.models.logging import StructuredLogEntry
+
+        updated_position_ids: list[str] = []
+        refreshed_markets: set[str] = set()
+        refreshed_at = datetime.now(tz=UTC)
         async with self._session_factory() as session:
-            for entry in held_entries:
-                try:
-                    position = await session.get(Position, uuid.UUID(entry.position_id))
-                except (TypeError, ValueError):
-                    continue
-                if position is None or position.status != "open":
+            rows = (
+                await session.execute(
+                    select(Position, Market)
+                    .join(Market, Position.market_id == Market.id)
+                    .where(
+                        Position.status == "open",
+                        Market.market_id.in_(list(watched_markets.keys())),
+                    )
+                )
+            ).all()
+
+            if not rows:
+                return
+
+            rows_by_market: dict[str, list[tuple[Any, Any]]] = {}
+            for position, market in rows:
+                rows_by_market.setdefault(market.market_id, []).append((position, market))
+
+            for market_id, entry in watched_markets.items():
+                market_rows = rows_by_market.get(market_id, [])
+                if not market_rows:
                     continue
 
                 current_price = float(entry.last_price)
-                position.current_price = current_price
-                position.unrealized_pnl = self._paper_unrealized_pnl(
-                    position.side,
-                    float(position.remaining_size or position.size),
-                    float(position.entry_price),
-                    current_price,
-                )
-                updated = True
+                for position, market in market_rows:
+                    next_unrealized_pnl = self._paper_unrealized_pnl(
+                        position.side,
+                        float(position.remaining_size or position.size),
+                        float(position.entry_price),
+                        current_price,
+                    )
+                    if (
+                        position.current_price != current_price
+                        or position.unrealized_pnl != next_unrealized_pnl
+                    ):
+                        updated_position_ids.append(str(position.id))
 
-                market_stmt = select(Market).where(Market.market_id == entry.market_id)
-                market = (await session.execute(market_stmt)).scalar_one_or_none()
-                if market is not None:
+                    position.current_price = current_price
+                    position.unrealized_pnl = next_unrealized_pnl
                     market.last_price = current_price
                     market.last_spread = entry.last_spread
-                    market.last_snapshot_at = datetime.now(tz=UTC)
+                    market.last_snapshot_at = refreshed_at
+                    refreshed_markets.add(market_id)
 
-            if updated:
+            if refreshed_markets and updated_position_ids:
+                session.add(
+                    StructuredLogEntry(
+                        event_type="position_mark_to_market",
+                        severity="info",
+                        component="portfolio_monitor",
+                        payload={
+                            "markets_refreshed": sorted(refreshed_markets),
+                            "positions_updated": updated_position_ids,
+                            "position_count": len(updated_position_ids),
+                        },
+                        message=(
+                            f"Marked {len(updated_position_ids)} open positions to market "
+                            f"across {len(refreshed_markets)} watched markets"
+                        ),
+                        logged_at=refreshed_at,
+                    )
+                )
+
+            if refreshed_markets:
                 await session.commit()
+
+        if updated_position_ids:
+            _log.info(
+                "paper_positions_marked_to_market",
+                positions_updated=len(updated_position_ids),
+                markets_refreshed=len(refreshed_markets),
+            )
 
     async def _ensure_market_row(
         self,
@@ -2891,6 +3159,10 @@ class WorkflowOrchestrator:
                 _log.debug("dashboard_sync_risk_error", error=str(exc))
 
         try:
+            _system_state["paper_balance_usd"] = round(
+                float(self._portfolio.account_balance_usd),
+                2,
+            )
             _system_state["paper_equity_usd"] = round(
                 float(self._portfolio.current_equity_usd),
                 2,
@@ -2904,18 +3176,21 @@ class WorkflowOrchestrator:
 
         # Equity snapshot for the chart (taken every sync cycle, ~5 min)
         try:
-            from dashboard_api.app import _add_equity_snapshot
+            if self._skip_next_equity_snapshot:
+                self._skip_next_equity_snapshot = False
+            else:
+                from dashboard_api.app import _add_equity_snapshot
 
-            equity = _system_state.get(
-                "paper_equity_usd", self._portfolio.current_equity_usd
-            )
-            start_equity = _system_state.get(
-                "start_of_day_equity_usd", self._portfolio.start_of_day_equity_usd
-            )
-            _add_equity_snapshot(
-                equity_usd=round(float(equity), 2),
-                pnl_usd=round(float(equity) - float(start_equity), 2),
-            )
+                equity = _system_state.get(
+                    "paper_equity_usd", self._portfolio.current_equity_usd
+                )
+                start_equity = _system_state.get(
+                    "start_of_day_equity_usd", self._portfolio.start_of_day_equity_usd
+                )
+                _add_equity_snapshot(
+                    equity_usd=round(float(equity), 2),
+                    pnl_usd=round(float(equity) - float(start_equity), 2),
+                )
         except Exception as exc:
             _log.debug("dashboard_sync_equity_snapshot_error", error=str(exc))
 

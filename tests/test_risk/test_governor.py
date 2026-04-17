@@ -10,6 +10,10 @@ from risk.governor import RiskGovernor
 from risk.types import PortfolioState, SizingRequest
 
 
+def _equity_for_drawdown(config: RiskConfig, pct: float) -> float:
+    return 10000.0 * (1.0 - pct)
+
+
 @pytest.fixture
 def config():
     return RiskConfig()
@@ -72,9 +76,9 @@ def test_assess_returns_all_rule_results(governor, portfolio):
 
 # --- Drawdown blocks ---
 
-def test_reject_drawdown_entries_disabled(governor, portfolio):
-    """Entries disabled at 6.5% drawdown."""
-    governor.update_equity(9350.0)
+def test_reject_drawdown_entries_disabled(governor, portfolio, config):
+    """Entries disabled at 3.5% drawdown."""
+    governor.update_equity(_equity_for_drawdown(config, config.entries_disabled_pct))
     request = _make_request()
     assessment = governor.assess(request, portfolio)
     assert assessment.approval == RiskApproval.REJECT
@@ -82,24 +86,24 @@ def test_reject_drawdown_entries_disabled(governor, portfolio):
     assert assessment.sizing is None
 
 
-def test_reject_hard_kill_switch(governor, portfolio):
-    governor.update_equity(9200.0)
+def test_reject_hard_kill_switch(governor, portfolio, config):
+    governor.update_equity(_equity_for_drawdown(config, config.hard_kill_switch_pct))
     request = _make_request()
     assessment = governor.assess(request, portfolio)
     assert assessment.approval == RiskApproval.REJECT
 
 
-def test_reduced_at_soft_warning(governor, portfolio):
+def test_reduced_at_soft_warning(governor, portfolio, config):
     """Soft warning should approve with reduced size."""
-    governor.update_equity(9700.0)
+    governor.update_equity(_equity_for_drawdown(config, config.soft_warning_pct))
     request = _make_request()
     assessment = governor.assess(request, portfolio)
     assert assessment.approval == RiskApproval.APPROVE_REDUCED
     assert assessment.sizing is not None
 
 
-def test_reduced_at_risk_reduction(governor, portfolio):
-    governor.update_equity(9500.0)
+def test_reduced_at_risk_reduction(governor, portfolio, config):
+    governor.update_equity(_equity_for_drawdown(config, config.risk_reduction_pct))
     request = _make_request()
     assessment = governor.assess(request, portfolio)
     assert assessment.approval == RiskApproval.APPROVE_REDUCED
@@ -211,9 +215,9 @@ def test_reject_category_cap_exceeded(governor):
 
 # --- Evidence threshold ---
 
-def test_delay_low_evidence_under_drawdown(governor, portfolio):
+def test_delay_low_evidence_under_drawdown(governor, portfolio, config):
     """Low evidence under soft warning should delay."""
-    governor.update_equity(9700.0)  # soft warning
+    governor.update_equity(_equity_for_drawdown(config, config.soft_warning_pct))
     request = _make_request(evidence_quality_score=0.3)
     assessment = governor.assess(request, portfolio)
     assert assessment.approval == RiskApproval.DELAY
@@ -226,8 +230,8 @@ def test_can_trade_normal(governor, portfolio):
     assert allowed is True
 
 
-def test_can_trade_drawdown_blocks(governor, portfolio):
-    governor.update_equity(9350.0)  # entries disabled
+def test_can_trade_drawdown_blocks(governor, portfolio, config):
+    governor.update_equity(_equity_for_drawdown(config, config.entries_disabled_pct))
     allowed, reason = governor.can_trade(portfolio)
     assert allowed is False
     assert "drawdown" in reason.lower()
@@ -279,8 +283,8 @@ def test_can_trade_daily_deployment_exhausted(governor):
 
 # --- Special conditions ---
 
-def test_special_conditions_under_drawdown(governor, portfolio):
-    governor.update_equity(9700.0)  # soft warning
+def test_special_conditions_under_drawdown(governor, portfolio, config):
+    governor.update_equity(_equity_for_drawdown(config, config.soft_warning_pct))
     request = _make_request()
     assessment = governor.assess(request, portfolio)
     assert any("review interval" in c.lower() for c in assessment.special_conditions)
@@ -288,8 +292,8 @@ def test_special_conditions_under_drawdown(governor, portfolio):
 
 # --- Day lifecycle ---
 
-def test_reset_day(governor):
-    governor.update_equity(9200.0)  # kill switch
+def test_reset_day(governor, config):
+    governor.update_equity(_equity_for_drawdown(config, config.hard_kill_switch_pct))
     assert governor.drawdown_state.level == DrawdownLevel.HARD_KILL_SWITCH
 
     governor.reset_day(10500.0)
@@ -297,16 +301,16 @@ def test_reset_day(governor):
     assert governor.drawdown_state.start_of_day_equity == 10500.0
 
 
-def test_update_equity(governor):
-    state = governor.update_equity(9700.0)
+def test_update_equity(governor, config):
+    state = governor.update_equity(_equity_for_drawdown(config, config.soft_warning_pct))
     assert state.level == DrawdownLevel.SOFT_WARNING
-    assert state.current_equity == 9700.0
+    assert state.current_equity == _equity_for_drawdown(config, config.soft_warning_pct)
 
 
 # --- Drawdown state tracked through assessment ---
 
-def test_drawdown_state_in_assessment(governor, portfolio):
-    governor.update_equity(9700.0)
+def test_drawdown_state_in_assessment(governor, portfolio, config):
+    governor.update_equity(_equity_for_drawdown(config, config.soft_warning_pct))
     request = _make_request()
     assessment = governor.assess(request, portfolio)
     assert assessment.drawdown_state.level == DrawdownLevel.SOFT_WARNING

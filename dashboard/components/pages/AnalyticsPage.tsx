@@ -3,12 +3,16 @@
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from "recharts";
+import type { TooltipContentProps, TooltipValueType } from "recharts";
 import { BarChart3, DollarSign, Eye, AlertTriangle } from "lucide-react";
 import type { CategoryPerformanceEntry, CostMetrics, BiasAuditOverview, ViabilityOverview } from "@/lib/api";
 
 const CHART_COLORS = ["#39FF14", "#00D4FF", "#9B5DE5", "#FFBE0B", "#FF6B35", "#FF3B5C"];
 
-const CustomTooltip = ({ active, payload }: any) => {
+const CustomTooltip = ({
+  active,
+  payload,
+}: TooltipContentProps<TooltipValueType, string>) => {
   if (!active || !payload?.length) return null;
   return (
     <div style={{
@@ -16,9 +20,15 @@ const CustomTooltip = ({ active, payload }: any) => {
       borderRadius: "var(--radius-sm)", padding: "0.5rem 0.75rem", fontSize: "0.72rem",
     }}>
       <div style={{ fontWeight: 600 }}>{payload[0]?.payload?.category}</div>
-      {payload.map((p: any, i: number) => (
-        <div key={i} style={{ color: p.color || "var(--text)" }}>
-          {p.name}: {typeof p.value === "number" ? (p.name.includes("pnl") || p.name.includes("cost") ? `$${p.value.toFixed(2)}` : p.value.toFixed(3)) : p.value}
+      {payload.map((entry, i: number) => (
+        <div key={i} style={{ color: entry.color || "var(--text)" }}>
+          {entry.name}: {
+            typeof entry.value === "number"
+              ? (entry.name?.includes("pnl") || entry.name?.includes("cost")
+                  ? `$${entry.value.toFixed(2)}`
+                  : entry.value.toFixed(3))
+              : String(entry.value ?? "—")
+          }
         </div>
       ))}
     </div>

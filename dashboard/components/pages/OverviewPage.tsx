@@ -85,6 +85,28 @@ function timeAgo(timestamp: string): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
+function formatPercent(value: number): string {
+  const percent = value * 100;
+  return Number.isInteger(percent) ? `${percent}%` : `${percent.toFixed(1)}%`;
+}
+
+function formatSignedUsd(value: number | null | undefined): string {
+  const amount = Number(value ?? 0);
+  if (!Number.isFinite(amount) || amount === 0) {
+    return "$0.00";
+  }
+  if (amount > 0 && amount < 0.01) {
+    return "<$0.01";
+  }
+  if (amount < 0 && amount > -0.01) {
+    return "-$0.01";
+  }
+  if (amount > 0) {
+    return `+$${amount.toFixed(2)}`;
+  }
+  return `-$${Math.abs(amount).toFixed(2)}`;
+}
+
 export function OverviewPage({ data }: { data: DashboardData }) {
   const p = data.portfolio;
   const [timeframe, setTimeframe] = useState<"D" | "W" | "M" | "All">("D");
@@ -116,6 +138,13 @@ export function OverviewPage({ data }: { data: DashboardData }) {
 
   if (!p) return null;
 
+  const riskColor =
+    p.drawdown_level === "normal"
+      ? "var(--green)"
+      : p.drawdown_level === "soft_warning"
+        ? "var(--yellow)"
+        : "var(--red)";
+
   return (
     <div>
       <div className="page-header">
@@ -136,7 +165,10 @@ export function OverviewPage({ data }: { data: DashboardData }) {
             ${p.total_equity_usd.toLocaleString(undefined, { minimumFractionDigits: 2 })}
           </div>
           <div className="stat-label">
-            {p.operator_mode === "shadow" || p.operator_mode === "paper" ? "Paper balance" : "Account balance"}
+            {p.operator_mode === "shadow" || p.operator_mode === "paper" ? "Paper equity" : "Account equity"}
+          </div>
+          <div className="stat-label" style={{ marginTop: "0.25rem" }}>
+            Cash: ${p.paper_cash_balance_usd.toFixed(2)}  Reserved: ${p.paper_reserved_capital_usd.toFixed(2)}
           </div>
         </div>
 
@@ -146,11 +178,11 @@ export function OverviewPage({ data }: { data: DashboardData }) {
             {p.daily_pnl_usd >= 0 ? <ArrowUpRight size={14} color="var(--green)" /> : <ArrowDownRight size={14} color="var(--red)" />}
           </div>
           <div className="stat-value" style={{ color: p.daily_pnl_usd >= 0 ? "var(--green)" : "var(--red)" }}>
-            {p.daily_pnl_usd >= 0 ? "+" : ""}${p.daily_pnl_usd.toFixed(2)}
+            {formatSignedUsd(p.daily_pnl_usd)}
           </div>
           <div style={{ display: "flex", gap: "1rem", marginTop: "0.25rem" }}>
-            <span className="stat-label">Unrealized: <span style={{ color: p.unrealized_pnl_usd >= 0 ? "var(--green)" : "var(--red)" }}>${p.unrealized_pnl_usd.toFixed(2)}</span></span>
-            <span className="stat-label">Realized: <span style={{ color: p.realized_pnl_usd >= 0 ? "var(--green)" : "var(--red)" }}>${p.realized_pnl_usd.toFixed(2)}</span></span>
+            <span className="stat-label">Unrealized: <span style={{ color: p.unrealized_pnl_usd >= 0 ? "var(--green)" : "var(--red)" }}>{formatSignedUsd(p.unrealized_pnl_usd)}</span></span>
+            <span className="stat-label">Realized: <span style={{ color: p.realized_pnl_usd >= 0 ? "var(--green)" : "var(--red)" }}>{formatSignedUsd(p.realized_pnl_usd)}</span></span>
           </div>
         </div>
 
@@ -168,10 +200,10 @@ export function OverviewPage({ data }: { data: DashboardData }) {
         <div className="card fade-in stagger-4">
           <div className="card-header">
             <span className="card-title">Risk State</span>
-            <Shield size={14} color={p.drawdown_pct > 3 ? "var(--yellow)" : "var(--green)"} />
+            <Shield size={14} color={riskColor} />
           </div>
-          <div className="stat-value" style={{ color: p.drawdown_pct > 3 ? "var(--yellow)" : "var(--text)" }}>
-            {p.drawdown_pct.toFixed(1)}%
+          <div className="stat-value" style={{ color: riskColor }}>
+            {formatPercent(p.drawdown_pct)}
           </div>
           <div style={{ marginTop: "0.5rem" }}>
             <span className={`badge ${p.drawdown_level === "normal" ? "green" : p.drawdown_level === "soft_warning" ? "yellow" : "red"}`}>
@@ -319,7 +351,7 @@ export function OverviewPage({ data }: { data: DashboardData }) {
             <Target size={14} color="var(--blue)" />
           </div>
           <div style={{ maxHeight: 280, overflowY: "auto" }}>
-            {data.positions.length === 0 ? (
+            {data.positions.filter(p => p.status === "open").length === 0 ? (
               <div style={{ padding: "1.5rem", textAlign: "center", color: "var(--text-dim)", fontSize: "0.75rem" }}>
                 No open positions yet
               </div>
@@ -327,17 +359,29 @@ export function OverviewPage({ data }: { data: DashboardData }) {
               <table className="data-table">
                 <thead><tr><th>Market</th><th>Side</th><th>P&L</th><th>Status</th></tr></thead>
                 <tbody>
-                  {data.positions.slice(0, 5).map((pos) => (
+                  {data.positions.filter(p => p.status === "open").slice(0, 5).map((pos) => (
                     <tr key={pos.id}>
                       <td style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{pos.market_title}</td>
                       <td><span className={`badge ${pos.side === "yes" ? "green" : "red"}`}>{pos.side}</span></td>
                       <td style={{ color: (pos.unrealized_pnl || 0) >= 0 ? "var(--green)" : "var(--red)" }}>
-                        {(pos.unrealized_pnl || 0) >= 0 ? "+" : ""}${(pos.unrealized_pnl || 0).toFixed(2)}
+                        {formatSignedUsd(pos.unrealized_pnl)}
                       </td>
                       <td><span className={`badge ${pos.review_tier === "new" ? "blue" : pos.review_tier === "stable" ? "green" : "muted"}`}>{pos.review_tier}</span></td>
                     </tr>
                   ))}
                 </tbody>
+                <tfoot>
+                  <tr style={{ borderTop: "1px solid var(--border)", fontWeight: "bold", fontSize: "0.7rem", backgroundColor: "rgba(255,255,255,0.01)" }}>
+                    <td colSpan={2} style={{ textAlign: "right", padding: "0.8rem 1rem" }}>TOTAL</td>
+                    <td style={{
+                      padding: "0.8rem 1rem",
+                      color: data.positions.filter(p => p.status === "open").reduce((sum, p) => sum + (p.unrealized_pnl || 0), 0) >= 0 ? "var(--green)" : "var(--red)",
+                    }}>
+                      {formatSignedUsd(data.positions.filter(p => p.status === "open").reduce((sum, p) => sum + (p.unrealized_pnl || 0), 0))}
+                    </td>
+                    <td style={{ padding: "0.8rem 1rem" }}></td>
+                  </tr>
+                </tfoot>
               </table>
             )}
           </div>

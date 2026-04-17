@@ -54,6 +54,9 @@ export interface EquitySnapshot {
 
 export interface PortfolioOverview {
   total_equity_usd: number;
+  paper_cash_balance_usd: number;
+  paper_equity_usd: number;
+  paper_reserved_capital_usd: number;
   total_open_exposure_usd: number;
   daily_pnl_usd: number;
   unrealized_pnl_usd: number;
@@ -327,6 +330,9 @@ function getPersistedSystemStatus(): string {
 
 const mockPortfolio: PortfolioOverview = {
   total_equity_usd: 500.0,
+  paper_cash_balance_usd: 500.0,
+  paper_equity_usd: 500.0,
+  paper_reserved_capital_usd: 0.0,
   total_open_exposure_usd: 0,
   daily_pnl_usd: 0,
   unrealized_pnl_usd: 0,
@@ -341,12 +347,12 @@ const mockPortfolio: PortfolioOverview = {
 
 const mockRisk: RiskBoard = {
   drawdown_ladder: {
-    current_drawdown_pct: 0, soft_warning_pct: 3, risk_reduction_pct: 5,
-    entries_disabled_pct: 6.5, hard_kill_switch_pct: 8, current_level: "normal",
+    current_drawdown_pct: 0, soft_warning_pct: 0.01, risk_reduction_pct: 0.02,
+    entries_disabled_pct: 0.035, hard_kill_switch_pct: 0.04, current_level: "normal",
   },
   total_exposure_usd: 0, max_exposure_usd: 250,
   exposure_by_category: [],
-  correlation_groups_count: 0, daily_deployment_used_pct: 0, max_daily_deployment_pct: 10,
+  correlation_groups_count: 0, daily_deployment_used_pct: 0, max_daily_deployment_pct: 0.10,
 };
 
 const mockCost: CostMetrics = {

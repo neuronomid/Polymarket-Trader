@@ -1,6 +1,6 @@
 "use client";
 
-import { Bot, Play, Square } from "lucide-react";
+import { Play, Square } from "lucide-react";
 import type { AgentStatus } from "@/lib/api";
 
 const tierColors: Record<string, string> = {
